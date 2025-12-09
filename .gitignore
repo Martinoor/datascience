@@ -26,6 +26,7 @@ venv/
 *.pth
 *.onnx
 *.joblib
+*.png
 
 # Logs
 *.log
