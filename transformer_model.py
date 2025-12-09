@@ -1,5 +1,7 @@
 """
 Transformer model utilities for churn prediction on sequential user data.
+
+ref: Attention is All You Need , Google
 """
 from __future__ import annotations
 
@@ -17,24 +19,24 @@ from tqdm import tqdm
 
 @dataclass
 class TrainingConfig:
-    d_model: int = 128
-    nhead: int = 4
-    num_layers: int = 2
-    dim_feedforward: int = 256
-    dropout: float = 0.2
-    max_seq_len: int = 400
-    batch_size: int = 32
-    lr: float = 1e-3
-    weight_decay: float = 5e-4
-    epochs: int = 8
-    num_workers: int = 0
-    use_cosine_decay: bool = False
-    eta_min_factor: float = 0.1
-    warmup_epochs: int = 0
-    use_focal_loss: bool = False
-    focal_gamma: float = 2.0
-    early_stop_patience: int = 0  # <=0 表示不启用
-    early_stop_min_delta: float = 0.0
+    d_model: int = 128  # Hidden size for Transformer projections/outputs
+    nhead: int = 4  # Number of attention heads per encoder layer
+    num_layers: int = 2  # Stacked Transformer encoder layer count
+    dim_feedforward: int = 256  # Width of the feedforward block inside encoder layers
+    dropout: float = 0.2  # Dropout rate applied to inputs and MLP
+    max_seq_len: int = 400  # Maximum sequence length to retain per user
+    batch_size: int = 32  # Mini-batch size for DataLoader
+    lr: float = 1e-3  # Initial learning rate for AdamW
+    weight_decay: float = 5e-4  # L2-style weight decay for regularization
+    epochs: int = 8  # Number of training epochs
+    num_workers: int = 0  # DataLoader worker processes for CPU-side batching
+    use_cosine_decay: bool = False  # Whether to apply cosine annealing after warmup
+    eta_min_factor: float = 0.1  # Multiplier for minimum LR in cosine schedule
+    warmup_epochs: int = 0  # Linear warmup duration before decay starts
+    use_focal_loss: bool = False  # Enable focal loss to focus on hard positives/negatives
+    focal_gamma: float = 2.0  # Gamma parameter for focal loss curvature
+    early_stop_patience: int = 0  # <=0 disables early stopping on validation loss
+    early_stop_min_delta: float = 0.0  # Minimum improvement required to reset patience
 
 
 @dataclass

@@ -56,7 +56,7 @@ def truncate_user_histories(
 ) -> pd.DataFrame:
     """
     Trim the latest part of each user's timeline to mimic test distribution and
-    reduce leakage from behaviors紧贴退订前的尾段。
+    reduce leakage from behaviors right before churn events.
     """
     kept = []
     for _, g in df.sort_values(["userId", "time"]).groupby("userId", sort=False):
@@ -201,16 +201,16 @@ def get_song_stats_fast(df: pd.DataFrame) -> pd.DataFrame:
             artist_top1_frac[idx] = 0.0
             artist_top3_frac[idx] = 0.0
 
-    df["num_distinct_song_until_now"] = user_song_count
-    df["num_distinct_artist_until_now"] = user_artist_count
-    df["song_top1_frac_until_now"] = song_top1_frac
-    df["song_top1_count_until_now"] = song_top1_count
-    df["song_top3_frac_until_now"] = song_top3_frac
-    df["song_top3_count_until_now"] = song_top3_count
-    df["artist_top1_frac_until_now"] = artist_top1_frac
-    df["artist_top1_count_until_now"] = artist_top1_count
-    df["artist_top3_frac_until_now"] = artist_top3_frac
-    df["artist_top3_count_until_now"] = artist_top3_count
+    df["num_distinct_song_until_now"] = user_song_count  # Unique songs seen by the user so far
+    df["num_distinct_artist_until_now"] = user_artist_count  # Unique artists seen so far
+    df["song_top1_frac_until_now"] = song_top1_frac  # Share of plays made up by the user's top song
+    df["song_top1_count_until_now"] = song_top1_count  # Play count of the most played song so far
+    df["song_top3_frac_until_now"] = song_top3_frac  # Share of plays from the top 3 songs combined
+    df["song_top3_count_until_now"] = song_top3_count  # Total plays across the top 3 songs
+    df["artist_top1_frac_until_now"] = artist_top1_frac  # Share of plays from the top artist
+    df["artist_top1_count_until_now"] = artist_top1_count  # Play count of the top artist
+    df["artist_top3_frac_until_now"] = artist_top3_frac  # Share of plays from the top 3 artists
+    df["artist_top3_count_until_now"] = artist_top3_count  # Total plays across the top 3 artists
 
     df = df.drop(columns=["_song_valid", "_artist_valid"])
     return df
@@ -233,22 +233,22 @@ def feature_engineer(df: pd.DataFrame, page_categories: Sequence[str]) -> pd.Dat
     df = df.drop(columns=to_drop)
     df = df.sort_values(["userId", "time"])
 
-    df["error occur"] = compute_error_ratio(df)
+    df["error occur"] = compute_error_ratio(df)  # Cumulative ratio of 404 responses up to each event
     df = df.drop(columns=["status"])
 
-    df["gender"] = df["gender"].map({"F": 0, "M": 1}).fillna(0).astype(np.int64)
-    df["level"] = df["level"].map({"free": 0, "paid": 1}).fillna(0).astype(np.int64)
+    df["gender"] = df["gender"].map({"F": 0, "M": 1}).fillna(0).astype(np.int64)  # Binary gender flag
+    df["level"] = df["level"].map({"free": 0, "paid": 1}).fillna(0).astype(np.int64)  # Paid vs free level
 
-    df = _add_page_dummies(df, page_categories)
+    df = _add_page_dummies(df, page_categories)  # One-hot indicators for every page category
 
-    df[["metro", "state"]] = df["location"].str.rsplit(", ", n=1, expand=True)
+    df[["metro", "state"]] = df["location"].str.rsplit(", ", n=1, expand=True)  # Split city/state from location
     df = df.drop(columns=["location"])
 
-    df["device"] = df["userAgent"].apply(detect_device)
+    df["device"] = df["userAgent"].apply(detect_device)  # Parsed device type from user agent
     df = df.drop(columns=["userAgent"])
 
-    df = get_song_stats_fast(df)
-    df["regis_time"] = df.time - df.registration
+    df = get_song_stats_fast(df)  # Rolling song/artist diversity and concentration stats
+    df["regis_time"] = df.time - df.registration  # Time since registration for each event
     df = df.drop(columns=["registration"])
     return df
 
@@ -261,10 +261,10 @@ def encode_categoricals(
     device_mapping: Dict[str, int],
 ) -> pd.DataFrame:
     page_idx = {cat: idx + 1 for idx, cat in enumerate(page_categories)}  # 0 = pad
-    df["page_id"] = df["page"].map(lambda x: page_idx.get(x, 0)).astype(np.int64)
-    df["metro_id"] = df["metro"].map(lambda x: metro_mapping.get(x, 0)).astype(np.int64)
-    df["state_id"] = df["state"].map(lambda x: state_mapping.get(x, 0)).astype(np.int64)
-    df["device_id"] = df["device"].map(lambda x: device_mapping.get(x, 0)).astype(np.int64)
+    df["page_id"] = df["page"].map(lambda x: page_idx.get(x, 0)).astype(np.int64)  # Integer ID for page category
+    df["metro_id"] = df["metro"].map(lambda x: metro_mapping.get(x, 0)).astype(np.int64)  # City/metro ID
+    df["state_id"] = df["state"].map(lambda x: state_mapping.get(x, 0)).astype(np.int64)  # State/region ID
+    df["device_id"] = df["device"].map(lambda x: device_mapping.get(x, 0)).astype(np.int64)  # Device type ID
     return df
 
 
@@ -308,31 +308,31 @@ def prepare_datasets(
     train_raw = pd.read_parquet(train_path)
     test_raw = pd.read_parquet(test_path)
 
-    # 标签：基于原始序列是否出现过 Cancellation Confirmation（全量，不受截断影响）
+    # Labels: whether the full original sequence ever contains Cancellation Confirmation (untruncated)
     labels = (
         train_raw.groupby("userId")["page"]
         .apply(lambda s: int((s == "Cancellation Confirmation").any()))
         .astype(int)
     )
 
-    # 可选：仅使用 cutoff_time 之前的行为做特征
+    # Optional: only keep behaviors before a cutoff timestamp when building features
     if cutoff_time is not None:
         cutoff_ts = pd.to_datetime(cutoff_time)
         train_raw = train_raw[train_raw["time"] <= cutoff_ts].copy()
         if drop_inactive_before_cutoff:
-            # 丢弃在 cutoff 前就没有任何记录的用户
+            # Drop users who have no activity before the cutoff
             active_users = train_raw["userId"].unique()
             labels = labels[labels.index.isin(active_users)]
 
-    # 训练/验证特征中移除 Cancellation Confirmation 行，避免泄漏
+    # Remove Cancellation Confirmation rows from feature building to avoid leakage
     train_raw = train_raw[train_raw["page"] != "Cancellation Confirmation"].copy()
 
-    # 时间序列截断，避免使用过于靠近退订节点的尾部行为
+    # Trim timelines to avoid using behaviors immediately before churn points
     train_raw = truncate_user_histories(
         train_raw, buffer_min=truncate_buffer_min, buffer_frac=truncate_buffer_frac
     )
 
-    # page 类别不包含 Cancellation Confirmation
+    # Page categories exclude Cancellation Confirmation itself
     page_categories = sorted(set(train_raw["page"]).union(set(test_raw["page"])))
 
     train_fe = feature_engineer(train_raw, page_categories)
@@ -345,10 +345,10 @@ def prepare_datasets(
     train_fe = encode_categoricals(train_fe, page_categories, metro_map, state_map, device_map)
     test_fe = encode_categoricals(test_fe, page_categories, metro_map, state_map, device_map)
 
-    train_fe["regis_time_seconds"] = train_fe["regis_time"].dt.total_seconds()
+    train_fe["regis_time_seconds"] = train_fe["regis_time"].dt.total_seconds()  # Seconds since registration
     test_fe["regis_time_seconds"] = test_fe["regis_time"].dt.total_seconds()
 
-    # 严格去除可能导致泄露或维度膨胀的列（原始类别、文本、page one-hot 等）
+    # Remove columns that may leak labels or explode dimensionality (raw categories, text, one-hots)
     drop_cols = set(page_categories) | {
         "page",
         "metro",
