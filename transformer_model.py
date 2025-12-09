@@ -258,7 +258,7 @@ def train_model(
     focal_gamma: float = 2.0,
     early_stop_patience: int = 0,
     early_stop_min_delta: float = 0.0,
-) -> Tuple[List[float], List[float], nn.Module]:
+) -> Tuple[List[float], List[float], nn.Module, int, Dict[str, torch.Tensor]]:
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = (
         CosineAnnealingLR(
@@ -270,6 +270,7 @@ def train_model(
     bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device), reduction="none")
     best_val = float("inf")
     best_state = deepcopy(model.state_dict())
+    best_epoch = -1
     train_history: List[float] = []
     val_history: List[float] = []
     no_improve = 0
@@ -350,6 +351,7 @@ def train_model(
         if val_loss < best_val - early_stop_min_delta:
             best_val = val_loss
             best_state = deepcopy(model.state_dict())
+            best_epoch = epoch
             no_improve = 0
         else:
             no_improve += 1
@@ -363,7 +365,7 @@ def train_model(
             break
 
     model.load_state_dict(best_state)
-    return train_history, val_history, model
+    return train_history, val_history, model, best_epoch, best_state
 
 
 def predict_proba(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
