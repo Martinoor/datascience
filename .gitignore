@@ -1,2 +1,39 @@
-churn-prediction-25-26/*.parquet
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment / secrets
+.env
+.env.*
+
+# Data and model artifacts
+*.csv
+*.parquet
+*.zip
+*.pkl
+*.pt
+*.npz
+*.npy
+*.h5
+*.pth
+*.onnx
+*.joblib
+*.png
+
+# Logs
+*.log
+
+# OS files
 .DS_Store
+
+# Build outputs
+build/
+dist/
