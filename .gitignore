@@ -1,2 +1,4 @@
-churn-prediction-25-26/*.parquet
 .DS_Store
+.parquet
+.csv
+.zip
