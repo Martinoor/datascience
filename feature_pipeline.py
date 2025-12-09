@@ -8,7 +8,7 @@ both train and test consistently.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -298,6 +298,8 @@ def prepare_datasets(
     random_state: int = 42,
     truncate_buffer_min: int = 2,
     truncate_buffer_frac: float = 0.1,
+    cutoff_time: Optional[pd.Timestamp] = None,
+    drop_inactive_before_cutoff: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, FeatureArtifacts]:
     """
     Full pipeline: load data, feature engineer, encode categoricals, scale numerics,
@@ -306,12 +308,21 @@ def prepare_datasets(
     train_raw = pd.read_parquet(train_path)
     test_raw = pd.read_parquet(test_path)
 
-    # 标签：基于原始序列是否出现过 Cancellation Confirmation
+    # 标签：基于原始序列是否出现过 Cancellation Confirmation（全量，不受截断影响）
     labels = (
         train_raw.groupby("userId")["page"]
         .apply(lambda s: int((s == "Cancellation Confirmation").any()))
         .astype(int)
     )
+
+    # 可选：仅使用 cutoff_time 之前的行为做特征
+    if cutoff_time is not None:
+        cutoff_ts = pd.to_datetime(cutoff_time)
+        train_raw = train_raw[train_raw["time"] <= cutoff_ts].copy()
+        if drop_inactive_before_cutoff:
+            # 丢弃在 cutoff 前就没有任何记录的用户
+            active_users = train_raw["userId"].unique()
+            labels = labels[labels.index.isin(active_users)]
 
     # 训练/验证特征中移除 Cancellation Confirmation 行，避免泄漏
     train_raw = train_raw[train_raw["page"] != "Cancellation Confirmation"].copy()
