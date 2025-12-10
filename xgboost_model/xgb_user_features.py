@@ -7,17 +7,20 @@ feature engineering utilities in `feature_pipeline.py`.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Integral
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-
+import sys
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 from feature_pipeline import (
     _build_mapping,
     encode_categoricals,
     feature_engineer,
+    truncate_last_days_per_user,
     truncate_user_histories,
 )
 
@@ -118,9 +121,14 @@ def prepare_user_level_datasets(
     random_state: int = 42,
     truncate_buffer_min: int = 3,
     truncate_buffer_frac: float = 0.2,
+    cutoff_time: Optional[Union[pd.Timestamp, str, int]] = None,
+    drop_inactive_before_cutoff: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, XGBFeatureArtifacts]:
     """
     Build user-level matrices for XGBoost training and inference.
+    Labels always reflect the full sequence (normal marking), while training
+    features can be restricted by a cutoff time to avoid leakage from later
+    behaviors.
     """
     train_raw = pd.read_parquet(train_path)
     test_raw = pd.read_parquet(test_path)
@@ -130,6 +138,20 @@ def prepare_user_level_datasets(
         .apply(lambda s: int((s == "Cancellation Confirmation").any()))
         .astype(int)
     )
+
+    # Optionally drop training events after a cutoff (keep labels untouched).
+    if cutoff_time is not None:
+        if isinstance(cutoff_time, Integral):
+            train_raw = truncate_last_days_per_user(train_raw, int(cutoff_time))
+            if drop_inactive_before_cutoff:
+                active_users = train_raw["userId"].unique()
+                labels = labels[labels.index.isin(active_users)]
+        else:
+            cutoff_ts = pd.to_datetime(cutoff_time)
+            train_raw = train_raw[train_raw["time"] <= cutoff_ts].copy()
+            if drop_inactive_before_cutoff:
+                active_users = train_raw["userId"].unique()
+                labels = labels[labels.index.isin(active_users)]
 
     # Remove explicit cancellation rows to avoid leakage.
     train_raw = train_raw[train_raw["page"] != "Cancellation Confirmation"].copy()

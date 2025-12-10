@@ -8,7 +8,8 @@ both train and test consistently.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from numbers import Integral
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -68,6 +69,19 @@ def truncate_user_histories(
         cutoff = max(L - buffer, 1)
         kept.append(g.iloc[:cutoff])
     return pd.concat(kept, ignore_index=True)
+
+
+def truncate_last_days_per_user(df: pd.DataFrame, days: int) -> pd.DataFrame:
+    """
+    Remove the most recent `days` worth of events for each user to simulate
+    forecasting into a future window.
+    """
+    if days <= 0:
+        return df.copy()
+    delta = pd.Timedelta(days=days)
+    user_max = df.groupby("userId")["time"].transform("max")
+    cutoff = user_max - delta
+    return df[df["time"] <= cutoff].copy()
 
 
 def _build_mapping(series_list: Sequence[pd.Series]) -> Dict[str, int]:
@@ -298,12 +312,14 @@ def prepare_datasets(
     random_state: int = 42,
     truncate_buffer_min: int = 2,
     truncate_buffer_frac: float = 0.1,
-    cutoff_time: Optional[pd.Timestamp] = None,
+    cutoff_time: Optional[Union[pd.Timestamp, str, int]] = None,
     drop_inactive_before_cutoff: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, FeatureArtifacts]:
     """
     Full pipeline: load data, feature engineer, encode categoricals, scale numerics,
     and split users into train/validation.
+    - cutoff_time: str/timestamp keeps events before that absolute time; int drops each user's
+      most recent `cutoff_time` days to train on earlier history and predict the held-out window.
     """
     train_raw = pd.read_parquet(train_path)
     test_raw = pd.read_parquet(test_path)
@@ -315,17 +331,26 @@ def prepare_datasets(
         .astype(int)
     )
 
-    # Optional: only keep behaviors before a cutoff timestamp when building features
+    # Optional: only keep behaviors before a cutoff point when building features.
     if cutoff_time is not None:
-        cutoff_ts = pd.to_datetime(cutoff_time)
-        train_raw = train_raw[train_raw["time"] <= cutoff_ts].copy()
-        if drop_inactive_before_cutoff:
-            # Drop users who have no activity before the cutoff
-            active_users = train_raw["userId"].unique()
-            labels = labels[labels.index.isin(active_users)]
+        if isinstance(cutoff_time, Integral):
+            train_raw = truncate_last_days_per_user(train_raw, int(cutoff_time))
+            # test_raw = truncate_last_days_per_user(test_raw, int(cutoff_time))
+            if drop_inactive_before_cutoff:
+                active_users = train_raw["userId"].unique()
+                labels = labels[labels.index.isin(active_users)]
+        else:
+            cutoff_ts = pd.to_datetime(cutoff_time)
+            train_raw = train_raw[train_raw["time"] <= cutoff_ts].copy()
+            if drop_inactive_before_cutoff:
+                # Drop users who have no activity before the cutoff
+                active_users = train_raw["userId"].unique()
+                labels = labels[labels.index.isin(active_users)]
 
     # Remove Cancellation Confirmation rows from feature building to avoid leakage
     train_raw = train_raw[train_raw["page"] != "Cancellation Confirmation"].copy()
+    train_raw = train_raw[train_raw["page"] != "Cancel"].copy()
+    # test_raw = test_raw[test_raw["page"] != "Cancellation Confirmation"].copy()
 
     # Trim timelines to avoid using behaviors immediately before churn points
     train_raw = truncate_user_histories(

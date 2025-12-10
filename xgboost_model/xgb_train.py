@@ -12,7 +12,7 @@ import pandas as pd
 from sklearn.metrics import log_loss
 from xgboost import XGBClassifier
 
-from .xgb_user_features import prepare_user_level_datasets
+from xgb_user_features import prepare_user_level_datasets
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = PACKAGE_DIR.parent
@@ -69,9 +69,13 @@ def run_pipeline(
     output_path: Path | str = DEFAULT_SUBMISSION_PATH,
     val_ratio: float = 0.2,
     random_state: int = 42,
+    cutoff_time: str | int | None = "2018-11-10",
+    drop_inactive_before_cutoff: bool = False,
 ) -> Tuple[XGBClassifier, float | None, Path]:
     """
     End-to-end training + prediction helper.
+    - Labels are derived on the full sequences as usual.
+    - Training features can be truncated with `cutoff_time` (default aligns with the Transformer notebook).
     """
     (
         train_df,
@@ -85,6 +89,8 @@ def run_pipeline(
         test_path=test_path,
         val_ratio=val_ratio,
         random_state=random_state,
+        cutoff_time=cutoff_time,
+        drop_inactive_before_cutoff=drop_inactive_before_cutoff,
     )
 
     feature_cols = artifacts.feature_names
@@ -96,7 +102,7 @@ def run_pipeline(
         val_logloss = log_loss(y_val, val_pred)
 
     test_pred = model.predict_proba(test_df[feature_cols])[:, 1]
-    submission = pd.DataFrame({"id": test_df["userId"], "target": test_pred})
+    submission = pd.DataFrame({"id": test_df["userId"], "target": (test_pred >= 0.5).astype(int).values})
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     submission.to_csv(output_path, index=False)
