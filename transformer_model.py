@@ -43,6 +43,7 @@ class TrainingConfig:
 class SequenceData:
     numeric: np.ndarray
     page_ids: np.ndarray
+    prev_page_ids: np.ndarray
     metro_ids: np.ndarray
     state_ids: np.ndarray
     device_ids: np.ndarray
@@ -69,6 +70,7 @@ class UserSequenceDataset(Dataset):
         return (
             seq.numeric.astype(np.float32),
             seq.page_ids.astype(np.int64),
+            seq.prev_page_ids.astype(np.int64),
             seq.metro_ids.astype(np.int64),
             seq.state_ids.astype(np.int64),
             seq.device_ids.astype(np.int64),
@@ -88,11 +90,12 @@ def build_user_sequences(
     """
     sequences: Dict[str, SequenceData] = {}
     grouped = df.sort_values(["userId", "time"]).groupby("userId", sort=False)
-    for user_id, g in grouped:
+    for user_id, g in tqdm(grouped, total=grouped.ngroups, desc="build_user_sequences"):
         g = g.tail(max_seq_len)
         sequences[user_id] = SequenceData(
             numeric=g[numeric_cols].to_numpy(np.float32),
             page_ids=g["page_id"].to_numpy(np.int64),
+            prev_page_ids=g["prev_page_id"].to_numpy(np.int64),
             metro_ids=g["metro_id"].to_numpy(np.int64),
             state_ids=g["state_id"].to_numpy(np.int64),
             device_ids=g["device_id"].to_numpy(np.int64),
@@ -101,7 +104,7 @@ def build_user_sequences(
 
 
 def collate_batch(batch):
-    numeric_seq, pages, metros, states, devices, labels, user_ids = zip(*batch)
+    numeric_seq, pages, prev_pages, metros, states, devices, labels, user_ids = zip(*batch)
     batch_size = len(batch)
     seq_lens = [len(x) for x in numeric_seq]
     max_len = max(seq_lens)
@@ -109,15 +112,19 @@ def collate_batch(batch):
 
     num_tensor = torch.zeros(batch_size, max_len, num_feat_dim, dtype=torch.float32)
     page_tensor = torch.zeros(batch_size, max_len, dtype=torch.long)
+    prev_page_tensor = torch.zeros(batch_size, max_len, dtype=torch.long)
     metro_tensor = torch.zeros(batch_size, max_len, dtype=torch.long)
     state_tensor = torch.zeros(batch_size, max_len, dtype=torch.long)
     device_tensor = torch.zeros(batch_size, max_len, dtype=torch.long)
     padding_mask = torch.ones(batch_size, max_len, dtype=torch.bool)
 
-    for i, (n, p, m, s, d) in enumerate(zip(numeric_seq, pages, metros, states, devices)):
+    for i, (n, p, pp, m, s, d) in enumerate(
+        zip(numeric_seq, pages, prev_pages, metros, states, devices)
+    ):
         length = len(n)
         num_tensor[i, :length] = torch.from_numpy(n)
         page_tensor[i, :length] = torch.from_numpy(p)
+        prev_page_tensor[i, :length] = torch.from_numpy(pp)
         metro_tensor[i, :length] = torch.from_numpy(m)
         state_tensor[i, :length] = torch.from_numpy(s)
         device_tensor[i, :length] = torch.from_numpy(d)
@@ -127,6 +134,7 @@ def collate_batch(batch):
     return (
         num_tensor,
         page_tensor,
+        prev_page_tensor,
         metro_tensor,
         state_tensor,
         device_tensor,
@@ -169,7 +177,8 @@ class ChurnTransformer(nn.Module):
         self.state_emb = nn.Embedding(num_state + 1, 12, padding_idx=0)
         self.device_emb = nn.Embedding(num_device + 1, 6, padding_idx=0)
 
-        cat_dim = 32 + 16 + 12 + 6
+        # Two page embeddings: current page_id and previous page_id (shared weights).
+        cat_dim = 32 + 32 + 16 + 12 + 6
         self.input_proj = nn.Linear(num_numeric + cat_dim, config.d_model)
         self.input_dropout = nn.Dropout(config.dropout)
         self.pos_encoder = PositionalEncoding(config.d_model, max_len=config.max_seq_len + 50)
@@ -192,6 +201,7 @@ class ChurnTransformer(nn.Module):
         self,
         numeric_feats: torch.Tensor,
         page_ids: torch.Tensor,
+        prev_page_ids: torch.Tensor,
         metro_ids: torch.Tensor,
         state_ids: torch.Tensor,
         device_ids: torch.Tensor,
@@ -200,6 +210,7 @@ class ChurnTransformer(nn.Module):
         cat_emb = torch.cat(
             [
                 self.page_emb(page_ids),
+                self.page_emb(prev_page_ids),
                 self.metro_emb(metro_ids),
                 self.state_emb(state_ids),
                 self.device_emb(device_ids),
@@ -284,6 +295,7 @@ def train_model(
             (
                 num_feats,
                 page_ids,
+                prev_page_ids,
                 metro_ids,
                 state_ids,
                 device_ids,
@@ -293,6 +305,7 @@ def train_model(
             ) = batch
             num_feats = num_feats.to(device)
             page_ids = page_ids.to(device)
+            prev_page_ids = prev_page_ids.to(device)
             metro_ids = metro_ids.to(device)
             state_ids = state_ids.to(device)
             device_ids = device_ids.to(device)
@@ -300,7 +313,9 @@ def train_model(
             labels = labels.to(device)
 
             optimizer.zero_grad()
-            logits = model(num_feats, page_ids, metro_ids, state_ids, device_ids, padding_mask)
+            logits = model(
+                num_feats, page_ids, prev_page_ids, metro_ids, state_ids, device_ids, padding_mask
+            )
             if use_focal_loss:
                 probs = torch.sigmoid(logits)
                 pt = probs * labels + (1 - probs) * (1 - labels)
@@ -322,6 +337,7 @@ def train_model(
                 (
                     num_feats,
                     page_ids,
+                    prev_page_ids,
                     metro_ids,
                     state_ids,
                     device_ids,
@@ -331,6 +347,7 @@ def train_model(
                 ) = batch
                 num_feats = num_feats.to(device)
                 page_ids = page_ids.to(device)
+                prev_page_ids = prev_page_ids.to(device)
                 metro_ids = metro_ids.to(device)
                 state_ids = state_ids.to(device)
                 device_ids = device_ids.to(device)
@@ -338,7 +355,13 @@ def train_model(
                 labels = labels.to(device)
 
                 logits = model(
-                    num_feats, page_ids, metro_ids, state_ids, device_ids, padding_mask
+                    num_feats,
+                    page_ids,
+                    prev_page_ids,
+                    metro_ids,
+                    state_ids,
+                    device_ids,
+                    padding_mask,
                 )
                 if use_focal_loss:
                     probs = torch.sigmoid(logits)
@@ -374,10 +397,11 @@ def predict_proba(model: nn.Module, loader: DataLoader, device: torch.device) ->
     model.eval()
     probs: Dict[str, float] = {}
     with torch.no_grad():
-        for batch in loader:
+        for batch in tqdm(loader, desc="predict_proba"):
             (
                 num_feats,
                 page_ids,
+                prev_page_ids,
                 metro_ids,
                 state_ids,
                 device_ids,
@@ -387,11 +411,14 @@ def predict_proba(model: nn.Module, loader: DataLoader, device: torch.device) ->
             ) = batch
             num_feats = num_feats.to(device)
             page_ids = page_ids.to(device)
+            prev_page_ids = prev_page_ids.to(device)
             metro_ids = metro_ids.to(device)
             state_ids = state_ids.to(device)
             device_ids = device_ids.to(device)
             padding_mask = padding_mask.to(device)
-            logits = model(num_feats, page_ids, metro_ids, state_ids, device_ids, padding_mask)
+            logits = model(
+                num_feats, page_ids, prev_page_ids, metro_ids, state_ids, device_ids, padding_mask
+            )
             batch_probs = torch.sigmoid(logits).cpu().numpy()
             for uid, prob in zip(user_ids, batch_probs):
                 probs[uid] = float(prob)

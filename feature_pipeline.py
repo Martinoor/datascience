@@ -7,8 +7,13 @@ both train and test consistently.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import pickle
 from dataclasses import dataclass
 from numbers import Integral
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -16,6 +21,23 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
+
+FEATURE_PIPELINE_VERSION = "1.1"
+
+# Key pages to track sequence statistics for (counts / rolling ratios).
+KEY_PAGES: List[str] = [
+    "Help",
+    "Settings",
+    "Upgrade",
+    "Downgrade",
+    "Submit Upgrade",
+    "Submit Downgrade",
+    "Logout",
+    "Error",
+    "Add Friend",
+]
+KEY_PAGE_ROLLING_WINDOW = 50
+
 
 @dataclass
 class FeatureArtifacts:
@@ -60,7 +82,8 @@ def truncate_user_histories(
     reduce leakage from behaviors right before churn events.
     """
     kept = []
-    for _, g in df.sort_values(["userId", "time"]).groupby("userId", sort=False):
+    grouped = df.sort_values(["userId", "time"]).groupby("userId", sort=False)
+    for _, g in tqdm(grouped, total=grouped.ngroups, desc="truncate_user_histories"):
         L = len(g)
         buffer = max(buffer_min, int(L * buffer_frac))
         if L <= 1:
@@ -238,6 +261,50 @@ def _add_page_dummies(df: pd.DataFrame, page_categories: Sequence[str]) -> pd.Da
     return df
 
 
+def _safe_page_feature_name(page: str) -> str:
+    """Turn a raw page name into a safe, concise column name fragment."""
+    name = page.strip().lower()
+    for ch in [" ", "/", "-", "(", ")", "[", "]"]:
+        name = name.replace(ch, "_")
+    while "__" in name:
+        name = name.replace("__", "_")
+    return name.strip("_")
+
+
+def _add_page_sequence_features(df: pd.DataFrame, window: int = KEY_PAGE_ROLLING_WINDOW) -> pd.DataFrame:
+    """
+    For each key page, add:
+    - cumulative count up to current event per user
+    - rolling ratio over the last `window` events per user
+
+    Implemented with groupby + cumsum / rolling to stay vectorized and efficient.
+    """
+    if "userId" not in df or "page" not in df:
+        return df
+
+    user_ids = df["userId"]
+    for page in KEY_PAGES:
+        safe = _safe_page_feature_name(page)
+        flag = (df["page"] == page).astype(np.int8)
+
+        count_col = f"{safe}_count_until_now"
+        ratio_col = f"{safe}_ratio_last_{window}_events"
+
+        # Cumulative count of this page for each user.
+        df[count_col] = flag.groupby(user_ids).cumsum().astype(np.int32)
+
+        # Rolling ratio of this page in the last `window` events for each user.
+        rolling = (
+            flag.groupby(user_ids)
+            .rolling(window, min_periods=1)
+            .mean()
+            .reset_index(level=0, drop=True)
+        )
+        df[ratio_col] = rolling.astype(np.float32)
+
+    return df
+
+
 def feature_engineer(df: pd.DataFrame, page_categories: Sequence[str]) -> pd.DataFrame:
     """
     Apply the feature engineering steps to a raw dataframe.
@@ -254,6 +321,11 @@ def feature_engineer(df: pd.DataFrame, page_categories: Sequence[str]) -> pd.Dat
     df["level"] = df["level"].map({"free": 0, "paid": 1}).fillna(0).astype(np.int64)  # Paid vs free level
 
     df = _add_page_dummies(df, page_categories)  # One-hot indicators for every page category
+
+    # Add sequence-based features for a handful of key pages (Help, Settings, etc.).
+    # This operates only on non-cancellation pages (train_raw has had cancellation rows removed),
+    # so we avoid direct label leakage.
+    df = _add_page_sequence_features(df)
 
     df[["metro", "state"]] = df["location"].str.rsplit(", ", n=1, expand=True)  # Split city/state from location
     df = df.drop(columns=["location"])
@@ -295,6 +367,7 @@ def _infer_numeric_cols(df: pd.DataFrame) -> List[str]:
         "time",
         "Cancellation Confirmation",
         "page_id",
+        "prev_page_id",
         "metro_id",
         "state_id",
         "device_id",
@@ -303,6 +376,35 @@ def _infer_numeric_cols(df: pd.DataFrame) -> List[str]:
         c for c in df.columns if c not in exclude and not pd.api.types.is_object_dtype(df[c])
     ]
     return numeric_cols
+
+
+def _build_cache_key(
+    train_path: str,
+    test_path: str,
+    val_ratio: float,
+    random_state: int,
+    truncate_buffer_min: int,
+    truncate_buffer_frac: float,
+    cutoff_time: Optional[Union[pd.Timestamp, str, int]],
+    drop_inactive_before_cutoff: bool,
+) -> str:
+    """
+    Build a stable hash key for a given feature configuration so that we can
+    cache and reuse computed datasets across runs.
+    """
+    key_payload = {
+        "version": FEATURE_PIPELINE_VERSION,
+        "train_path": str(Path(train_path).resolve()),
+        "test_path": str(Path(test_path).resolve()),
+        "val_ratio": float(val_ratio),
+        "random_state": int(random_state),
+        "truncate_buffer_min": int(truncate_buffer_min),
+        "truncate_buffer_frac": float(truncate_buffer_frac),
+        "cutoff_time": None if cutoff_time is None else str(cutoff_time),
+        "drop_inactive_before_cutoff": bool(drop_inactive_before_cutoff),
+    }
+    key_str = json.dumps(key_payload, sort_keys=True)
+    return hashlib.md5(key_str.encode("utf-8")).hexdigest()
 
 
 def prepare_datasets(
@@ -314,13 +416,42 @@ def prepare_datasets(
     truncate_buffer_frac: float = 0.1,
     cutoff_time: Optional[Union[pd.Timestamp, str, int]] = None,
     drop_inactive_before_cutoff: bool = False,
+    use_cache: bool = True,
+    cache_dir: str = "feature_cache",
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, FeatureArtifacts]:
     """
     Full pipeline: load data, feature engineer, encode categoricals, scale numerics,
     and split users into train/validation.
     - cutoff_time: str/timestamp keeps events before that absolute time; int drops each user's
       most recent `cutoff_time` days to train on earlier history and predict the held-out window.
+    - use_cache: when True, cache the resulting datasets to disk keyed by the arguments so
+      subsequent runs with the same configuration can be loaded instantly.
     """
+    cache_path: Optional[Path] = None
+    if use_cache:
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_key = _build_cache_key(
+            train_path=train_path,
+            test_path=test_path,
+            val_ratio=val_ratio,
+            random_state=random_state,
+            truncate_buffer_min=truncate_buffer_min,
+            truncate_buffer_frac=truncate_buffer_frac,
+            cutoff_time=cutoff_time,
+            drop_inactive_before_cutoff=drop_inactive_before_cutoff,
+        )
+        cache_path = Path(cache_dir) / f"features_{cache_key}.pkl"
+        if cache_path.exists():
+            with cache_path.open("rb") as f:
+                cached = pickle.load(f)
+            return (
+                cached["train_df"],
+                cached["val_df"],
+                cached["test_df"],
+                cached["labels"],
+                cached["artifacts"],
+            )
+
     train_raw = pd.read_parquet(train_path)
     test_raw = pd.read_parquet(test_path)
 
@@ -369,6 +500,14 @@ def prepare_datasets(
 
     train_fe = encode_categoricals(train_fe, page_categories, metro_map, state_map, device_map)
     test_fe = encode_categoricals(test_fe, page_categories, metro_map, state_map, device_map)
+
+    # Previous page ID within each user's sequence (0 = no previous page).
+    train_fe["prev_page_id"] = (
+        train_fe.groupby("userId")["page_id"].shift(1).fillna(0).astype(np.int64)
+    )
+    test_fe["prev_page_id"] = (
+        test_fe.groupby("userId")["page_id"].shift(1).fillna(0).astype(np.int64)
+    )
 
     train_fe["regis_time_seconds"] = train_fe["regis_time"].dt.total_seconds()  # Seconds since registration
     test_fe["regis_time_seconds"] = test_fe["regis_time"].dt.total_seconds()
@@ -421,4 +560,15 @@ def prepare_datasets(
         numeric_cols=numeric_cols,
         scaler=scaler,
     )
+    if cache_path is not None:
+        to_cache = {
+            "train_df": train_df,
+            "val_df": val_df,
+            "test_df": test_fe,
+            "labels": labels,
+            "artifacts": artifacts,
+        }
+        with cache_path.open("wb") as f:
+            pickle.dump(to_cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+
     return train_df, val_df, test_fe, labels, artifacts
