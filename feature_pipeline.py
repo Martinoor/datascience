@@ -22,7 +22,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
-FEATURE_PIPELINE_VERSION = "1.1"
+FEATURE_PIPELINE_VERSION = "1.2"
 
 # Key pages to track sequence statistics for (counts / rolling ratios).
 KEY_PAGES: List[str] = [
@@ -37,6 +37,7 @@ KEY_PAGES: List[str] = [
     "Add Friend",
 ]
 KEY_PAGE_ROLLING_WINDOW = 50
+SKIP_FRACTION_THRESHOLD = 0.5  # Fraction of song played below which we treat it as a skip
 
 
 @dataclass
@@ -305,6 +306,142 @@ def _add_page_sequence_features(df: pd.DataFrame, window: int = KEY_PAGE_ROLLING
     return df
 
 
+def _add_level_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add features describing level changes and upgrade/downgrade behavior.
+
+    - level_change_flag: whether the user's level changed vs the previous event.
+    - num_upgrade_events_until_now / num_downgrade_events_until_now: cumulative counts
+      of upgrade / downgrade related page events.
+    - events_since_last_level_change: number of events since the last level change
+      within each user's history (0 if never changed yet).
+    - days_since_last_level_change: time since the last level change in days
+      (0 if never changed yet).
+    """
+    if "userId" not in df or "level" not in df or "page" not in df or "time" not in df:
+        return df
+
+    # Flag level changes relative to previous event per user.
+    prev_level = df.groupby("userId")["level"].shift(1)
+    prev_level = prev_level.fillna(df["level"])
+    df["level_change_flag"] = (df["level"] != prev_level).astype(np.int8)
+
+    # Upgrade / downgrade events derived from pages.
+    upgrade_pages = {"Upgrade", "Submit Upgrade"}
+    downgrade_pages = {"Downgrade", "Submit Downgrade"}
+    user_ids = df["userId"]
+
+    upgrade_flag = df["page"].isin(upgrade_pages).astype(np.int8)
+    downgrade_flag = df["page"].isin(downgrade_pages).astype(np.int8)
+
+    df["num_upgrade_events_until_now"] = (
+        upgrade_flag.groupby(user_ids).cumsum().astype(np.int32)
+    )
+    df["num_downgrade_events_until_now"] = (
+        downgrade_flag.groupby(user_ids).cumsum().astype(np.int32)
+    )
+
+    # Events since last level change (per user).
+    event_idx = df.groupby(user_ids).cumcount().astype(np.int32)
+    last_change_idx = event_idx.where(df["level_change_flag"] == 1)
+    last_change_idx = last_change_idx.groupby(user_ids).ffill()
+    events_since = (event_idx - last_change_idx).fillna(event_idx).astype(np.int32)
+    df["events_since_last_level_change"] = events_since
+
+    # Time since last level change in days (0 if never changed).
+    last_change_time = df["time"].where(df["level_change_flag"] == 1)
+    last_change_time = last_change_time.groupby(user_ids).ffill()
+    delta_days = (df["time"] - last_change_time).dt.total_seconds() / (3600.0 * 24.0)
+    df["days_since_last_level_change"] = delta_days.fillna(0.0).astype(np.float32)
+
+    return df
+
+
+def _add_skip_and_length_features(
+    df: pd.DataFrame, window: int = KEY_PAGE_ROLLING_WINDOW
+) -> pd.DataFrame:
+    """
+    Add skip-related features based on NextSong behavior and song length:
+
+    - skip_event_flag: whether the previous song is considered skipped (based on
+      fraction of its length played before the next NextSong).
+    - num_skip_events_until_now / skip_ratio_until_now: cumulative skip stats.
+    - skip_ratio_last_{window}_events: rolling skip ratio over a recent window
+      of events (captures skip bursts).
+    - num_nextsong_until_now / avg_song_length_until_now: cumulative song count
+      and average song length for NextSong events.
+
+    All computations are vectorized via groupby/rolling for efficiency.
+    """
+    if (
+        "userId" not in df
+        or "page" not in df
+        or "time" not in df
+        or "length" not in df
+    ):
+        return df
+
+    user_ids = df["userId"]
+    is_nextsong = (df["page"] == "NextSong").astype(np.int8)
+    df["is_nextsong"] = is_nextsong
+
+    # Default: no skip.
+    df["skip_event_flag"] = np.zeros(len(df), dtype=np.float32)
+
+    # Compute skip flag and (optionally) play fraction only on NextSong rows.
+    mask = is_nextsong == 1
+    if mask.any():
+        ns = df[mask].copy()
+        ns = ns.sort_values(["userId", "time"])
+        g = ns.groupby("userId", sort=False)
+
+        # Time difference between this NextSong and the next NextSong for the same user.
+        next_time = g["time"].shift(-1)
+        play_secs = (next_time - ns["time"]).dt.total_seconds()
+
+        # Length of the current song; use NaN to avoid division by zero.
+        song_len = ns["length"].replace(0, np.nan)
+        play_frac = (play_secs / song_len).astype(np.float32)
+        play_frac = play_frac.clip(lower=0.0, upper=5.0)
+
+        skip_flag = (play_frac < SKIP_FRACTION_THRESHOLD).astype(np.float32)
+        skip_flag = skip_flag.fillna(0.0)
+
+        # Assign back to the main dataframe for NextSong rows.
+        df.loc[ns.index, "skip_event_flag"] = skip_flag
+
+    # Cumulative skip counts and ratios.
+    skip_flag_all = df["skip_event_flag"].astype(np.float32)
+    df["num_skip_events_until_now"] = (
+        skip_flag_all.groupby(user_ids).cumsum().astype(np.int32)
+    )
+
+    num_songs = is_nextsong.groupby(user_ids).cumsum().astype(np.int32)
+    df["num_nextsong_until_now"] = num_songs
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = df["num_skip_events_until_now"] / num_songs.replace(0, np.nan)
+    df["skip_ratio_until_now"] = ratio.fillna(0.0).astype(np.float32)
+
+    # Rolling skip ratio over the last `window` events (captures skip bursts).
+    rolling = (
+        skip_flag_all.groupby(user_ids)
+        .rolling(window, min_periods=1)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
+    df[f"skip_ratio_last_{window}_events"] = rolling.astype(np.float32)
+
+    # Average song length based on NextSong events.
+    song_len_for_avg = df["length"].where(is_nextsong == 1, 0.0).astype(np.float32)
+    cum_len = song_len_for_avg.groupby(user_ids).cumsum()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        avg_len = cum_len / num_songs.replace(0, np.nan)
+    df["avg_song_length_until_now"] = avg_len.fillna(0.0).astype(np.float32)
+
+    return df
+
+
 def feature_engineer(df: pd.DataFrame, page_categories: Sequence[str]) -> pd.DataFrame:
     """
     Apply the feature engineering steps to a raw dataframe.
@@ -326,6 +463,12 @@ def feature_engineer(df: pd.DataFrame, page_categories: Sequence[str]) -> pd.Dat
     # This operates only on non-cancellation pages (train_raw has had cancellation rows removed),
     # so we avoid direct label leakage.
     df = _add_page_sequence_features(df)
+
+    # Level change / upgrade / downgrade related features.
+    df = _add_level_features(df)
+
+    # Skip behavior & song length related features.
+    df = _add_skip_and_length_features(df)
 
     df[["metro", "state"]] = df["location"].str.rsplit(", ", n=1, expand=True)  # Split city/state from location
     df = df.drop(columns=["location"])
