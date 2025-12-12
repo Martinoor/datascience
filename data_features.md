@@ -5,5 +5,5 @@
 
 target:
 
-predict the probability of 'churm'  --- happens of Cansellation Confirmation
+predict the probability of 'churn'  == occurrence 'Cancellation Confirmation'
 
