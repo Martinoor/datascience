@@ -22,7 +22,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
-FEATURE_PIPELINE_VERSION = "1.2"
+FEATURE_PIPELINE_VERSION = "1.3"
 
 # Key pages to track sequence statistics for (counts / rolling ratios).
 KEY_PAGES: List[str] = [
@@ -442,13 +442,67 @@ def _add_skip_and_length_features(
     return df
 
 
+def _add_rhythm_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add lightweight time/rhythm features (vectorized).
+
+    These are designed to be cheap even on the full event table.
+    """
+    if "userId" not in df or "time" not in df:
+        return df
+
+    prev_time = df.groupby("userId")["time"].shift(1)
+    delta = (df["time"] - prev_time).dt.total_seconds()
+    delta = delta.fillna(0).clip(lower=0).astype(np.float32)
+
+    df["seconds_since_prev_event"] = delta
+    df["log1p_seconds_since_prev_event"] = np.log1p(delta).astype(np.float32)
+
+    hour = df["time"].dt.hour.astype(np.float32)
+    df["hour_sin"] = np.sin(2 * np.pi * hour / 24.0).astype(np.float32)
+    df["hour_cos"] = np.cos(2 * np.pi * hour / 24.0).astype(np.float32)
+
+    dow = df["time"].dt.dayofweek.astype(np.float32)
+    df["dow_sin"] = np.sin(2 * np.pi * dow / 7.0).astype(np.float32)
+    df["dow_cos"] = np.cos(2 * np.pi * dow / 7.0).astype(np.float32)
+    return df
+
+
+def _add_session_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add session-level structural features derived from (userId, sessionId).
+
+    We keep these as per-event features so they can be used in event sequences.
+    """
+    if "userId" not in df or "sessionId" not in df or "time" not in df:
+        return df
+
+    g = df.groupby(["userId", "sessionId"], sort=False)
+    start_time = g["time"].transform("min")
+    end_time = g["time"].transform("max")
+
+    elapsed = (df["time"] - start_time).dt.total_seconds().fillna(0).astype(np.float32)
+    duration = (end_time - start_time).dt.total_seconds().fillna(0).astype(np.float32)
+
+    df["session_elapsed_seconds"] = elapsed
+    df["session_duration_seconds"] = duration
+    df["session_event_count"] = g["time"].transform("size").astype(np.int32)
+    df["session_event_index"] = g.cumcount().astype(np.int32)
+    df["is_session_start"] = (df["session_event_index"] == 0).astype(np.int8)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        prog = elapsed / np.where(duration == 0, np.nan, duration)
+    df["session_progress"] = np.nan_to_num(prog, nan=0.0).astype(np.float32)
+    return df
+
+
 def feature_engineer(df: pd.DataFrame, page_categories: Sequence[str]) -> pd.DataFrame:
     """
     Apply the feature engineering steps to a raw dataframe.
     """
     df = df.copy()
-    to_drop = ["firstName", "lastName", "ts", "auth", "itemInSession", "sessionId", "method"]
-    df = df.drop(columns=to_drop)
+    to_drop = ["firstName", "lastName", "ts", "auth", "method"]
+    df = df.drop(columns=[c for c in to_drop if c in df.columns])
     df = df.sort_values(["userId", "time"])
 
     df["error occur"] = compute_error_ratio(df)  # Cumulative ratio of 404 responses up to each event
@@ -469,6 +523,13 @@ def feature_engineer(df: pd.DataFrame, page_categories: Sequence[str]) -> pd.Dat
 
     # Skip behavior & song length related features.
     df = _add_skip_and_length_features(df)
+
+    # Session and rhythm features.
+    df = _add_session_features(df)
+    df = _add_rhythm_features(df)
+
+    # Drop raw session keys after deriving features.
+    df = df.drop(columns=[c for c in ["itemInSession", "sessionId"] if c in df.columns])
 
     df[["metro", "state"]] = df["location"].str.rsplit(", ", n=1, expand=True)  # Split city/state from location
     df = df.drop(columns=["location"])

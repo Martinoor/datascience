@@ -1,0 +1,177 @@
+from __future__ import annotations
+
+"""
+Train a daily-sequence Transformer with seed ensembling (average voting).
+
+Outputs:
+- validation AUC (threshold-independent)
+- best threshold by F1 (for binary submissions)
+- `daily_feature/submission_daily.csv` (id,target with 0/1)
+
+Run:
+  python daily_feature/train_daily_ensemble.py
+"""
+
+from dataclasses import asdict
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+
+from daily_feature.daily_feature_pipeline import prepare_daily_datasets
+from daily_feature.daily_transformer_model import (
+    DailyChurnTransformer,
+    build_user_day_sequences,
+    make_day_dataloaders,
+    predict_day_proba,
+    train_day_model,
+)
+from transformer_model import TrainingConfig, average_prob_dicts, roc_auc_from_probs, set_seed
+
+
+def _best_threshold_by_f1(y_true: np.ndarray, y_prob: np.ndarray) -> tuple[float, float]:
+    thresholds = np.linspace(0.05, 0.95, 91, dtype=np.float32)
+    best_thr = 0.5
+    best_f1 = -1.0
+    for thr in thresholds:
+        y_pred = (y_prob >= thr).astype(np.int32)
+        tp = int(((y_pred == 1) & (y_true == 1)).sum())
+        fp = int(((y_pred == 1) & (y_true == 0)).sum())
+        fn = int(((y_pred == 0) & (y_true == 1)).sum())
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thr = float(thr)
+    return best_thr, float(best_f1)
+
+
+def _to_submission_frame(probs: dict[str, float], threshold: float) -> pd.DataFrame:
+    ids = list(probs.keys())
+    p = np.array([probs[i] for i in ids], dtype=np.float32)
+    target = (p >= threshold).astype(int)
+
+    # Kaggle sample uses integer IDs; cast when safe.
+    try:
+        ids_out = pd.to_numeric(pd.Series(ids), errors="raise").astype(int)
+    except Exception:
+        ids_out = pd.Series(ids)
+
+    out = pd.DataFrame({"id": ids_out, "target": target})
+    return out.sort_values("id").reset_index(drop=True)
+
+
+def main() -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    train_path = "churn-prediction-25-26/train.parquet"
+    test_path = "churn-prediction-25-26/test.parquet"
+
+    train_df, val_df, test_df, labels, artifacts = prepare_daily_datasets(
+        train_path,
+        test_path,
+        calendar_strategy="active",
+        include_song_artist=True,
+        use_cache=True,
+    )
+
+    config = TrainingConfig(
+        d_model=192,
+        nhead=4,
+        num_layers=3,
+        dim_feedforward=512,
+        dropout=0.2,
+        max_seq_len=51,
+        batch_size=256,
+        num_workers=4,
+        lr=5e-4,
+        weight_decay=2e-3,
+        epochs=25,
+        use_cosine_decay=True,
+        eta_min_factor=0.05,
+        warmup_epochs=3,
+        use_focal_loss=True,
+        focal_gamma=1.8,
+        pooling="attn",
+    )
+
+    # Positives are ~22%; keep similar scaling to your event model.
+    pos_weight = float((labels == 0).sum() / max(1, (labels == 1).sum()))
+
+    train_sequences = build_user_day_sequences(train_df, artifacts.numeric_cols, config.max_seq_len)
+    val_sequences = build_user_day_sequences(val_df, artifacts.numeric_cols, config.max_seq_len)
+    test_sequences = build_user_day_sequences(test_df, artifacts.numeric_cols, config.max_seq_len)
+
+    train_loader, val_loader = make_day_dataloaders(
+        train_sequences, val_sequences, labels.to_dict(), config
+    )
+    test_loader = torch.utils.data.DataLoader(
+        dataset=type(val_loader.dataset)(test_sequences, None, list(test_sequences.keys())),
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+        collate_fn=val_loader.collate_fn,
+    )
+
+    seeds = [42, 43, 44]
+    val_prob_dicts: list[dict[str, float]] = []
+    test_prob_dicts: list[dict[str, float]] = []
+
+    for seed in seeds:
+        set_seed(seed)
+        model = DailyChurnTransformer(
+            num_numeric=len(artifacts.numeric_cols),
+            num_dow=7,
+            num_metro=len(artifacts.metro_mapping),
+            num_state=len(artifacts.state_mapping),
+            num_device=len(artifacts.device_mapping),
+            config=config,
+        ).to(device)
+
+        _, _, model, best_epoch, _ = train_day_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            device=device,
+            epochs=config.epochs,
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+            pos_weight=pos_weight,
+            use_cosine_decay=config.use_cosine_decay,
+            eta_min_factor=config.eta_min_factor,
+            warmup_epochs=config.warmup_epochs,
+            use_focal_loss=config.use_focal_loss,
+            focal_gamma=config.focal_gamma,
+            early_stop_patience=config.early_stop_patience,
+            early_stop_min_delta=config.early_stop_min_delta,
+        )
+
+        print(f"[seed={seed}] best_epoch={best_epoch}")
+        val_probs = predict_day_proba(model, val_loader, device)
+        test_probs = predict_day_proba(model, test_loader, device)
+        val_prob_dicts.append(val_probs)
+        test_prob_dicts.append(test_probs)
+
+    val_probs_avg = average_prob_dicts(val_prob_dicts)
+    test_probs_avg = average_prob_dicts(test_prob_dicts)
+
+    auc = roc_auc_from_probs(labels.to_dict(), val_probs_avg)
+    val_users = list(val_probs_avg.keys())
+    y_true = np.array([int(labels[uid]) for uid in val_users], dtype=np.int32)
+    y_prob = np.array([val_probs_avg[uid] for uid in val_users], dtype=np.float32)
+    best_thr, best_f1 = _best_threshold_by_f1(y_true, y_prob)
+
+    print(f"val_auc={auc:.6f} best_thr={best_thr:.3f} best_f1={best_f1:.6f}")
+    print("config:", {k: v for k, v in asdict(config).items() if k in {"d_model","nhead","num_layers","dim_feedforward","dropout","max_seq_len","batch_size","lr","weight_decay","epochs","pooling"}})
+
+    sub = _to_submission_frame(test_probs_avg, best_thr)
+    out_path = Path("daily_feature") / "submission_daily.csv"
+    sub.to_csv(out_path, index=False)
+    print(f"wrote: {out_path}")
+
+
+if __name__ == "__main__":
+    main()
+
