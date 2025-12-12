@@ -38,6 +38,7 @@ class TrainingConfig:
     early_stop_patience: int = 0  # <=0 disables early stopping on validation loss
     early_stop_min_delta: float = 0.0  # Minimum improvement required to reset patience
     pooling: str = "mean"  # "mean" | "attn"
+    monitor: str = "val_loss"  # "val_loss" | "val_auc"
 
 
 def set_seed(seed: int) -> None:
@@ -319,6 +320,7 @@ def train_model(
     focal_gamma: float = 2.0,
     early_stop_patience: int = 0,
     early_stop_min_delta: float = 0.0,
+    monitor: str = "val_loss",  # "val_loss" | "val_auc"
 ) -> Tuple[List[float], List[float], nn.Module, int, Dict[str, torch.Tensor]]:
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = (
@@ -329,7 +331,12 @@ def train_model(
         else None
     )
     bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight], device=device), reduction="none")
-    best_val = float("inf")
+    monitor = str(monitor).lower()
+    if monitor not in {"val_loss", "val_auc"}:
+        raise ValueError(f"Unknown monitor={monitor!r}; use 'val_loss' or 'val_auc'.")
+    maximize = monitor == "val_auc"
+
+    best_metric = -float("inf") if maximize else float("inf")
     best_state = deepcopy(model.state_dict())
     best_epoch = -1
     train_history: List[float] = []
@@ -380,6 +387,8 @@ def train_model(
 
         model.eval()
         val_running = 0.0
+        val_logits: List[torch.Tensor] = []
+        val_labels: List[torch.Tensor] = []
         with torch.no_grad():
             for batch in val_loader:
                 (
@@ -419,10 +428,37 @@ def train_model(
                 else:
                     loss = bce(logits, labels).mean()
                 val_running += loss.item() * labels.size(0)
+                if monitor == "val_auc":
+                    val_logits.append(logits.detach().cpu())
+                    val_labels.append(labels.detach().cpu())
         val_loss = val_running / len(val_loader.dataset)
         val_history.append(val_loss)
-        if val_loss < best_val - early_stop_min_delta:
-            best_val = val_loss
+
+        if monitor == "val_auc":
+            from sklearn.metrics import roc_auc_score
+
+            if val_logits:
+                y_score = torch.sigmoid(torch.cat(val_logits)).numpy()
+                y_true = torch.cat(val_labels).numpy()
+                if len(np.unique(y_true)) >= 2:
+                    current_metric = float(roc_auc_score(y_true, y_score))
+                else:
+                    current_metric = float("nan")
+            else:
+                current_metric = float("nan")
+            if not np.isfinite(current_metric):
+                # Fall back to loss if AUC can't be computed.
+                current_metric = float(-val_loss)
+        else:
+            current_metric = float(val_loss)
+
+        improved = (
+            current_metric > best_metric + early_stop_min_delta
+            if maximize
+            else current_metric < best_metric - early_stop_min_delta
+        )
+        if improved:
+            best_metric = current_metric
             best_state = deepcopy(model.state_dict())
             best_epoch = epoch
             no_improve = 0

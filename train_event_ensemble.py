@@ -18,7 +18,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import matplotlib.pyplot as plt
 
+from kaggle_submit import submit_and_track
 from feature_pipeline import prepare_datasets
 from transformer_model import (
     ChurnTransformer,
@@ -70,34 +72,49 @@ def main() -> None:
 
     train_path = "churn-prediction-25-26/train.parquet"
     test_path = "churn-prediction-25-26/test.parquet"
+    competition = "churn-prediction-25-26"
+    submit_to_kaggle = True
 
     train_df, val_df, test_df, labels, artifacts = prepare_datasets(
-        train_path,
-        test_path,
-        use_cache=True,
-    )
+            train_path,
+            test_path,
+            val_ratio=0.2,
+            random_state=42,
+            truncate_buffer_min=2,
+            truncate_buffer_frac=0.02,
+            cutoff_time='2018-11-09',
+            use_cache = True
+        )
 
     config = TrainingConfig(
-        d_model=128,
+        d_model=256,
         nhead=4,
-        num_layers=5,
-        dim_feedforward=896,
-        dropout=0.1,
-        max_seq_len=400,
+        num_layers=4,            
+        dim_feedforward=768,    
+        dropout=0.1,           
+
+        max_seq_len=450,       
         batch_size=256,
         num_workers=4,
-        lr=5e-4,
-        weight_decay=2e-3,
-        epochs=40,
+
+        lr=6e-4,                 
+        weight_decay=1.5e-3,     
+        epochs=35,
+
         use_cosine_decay=True,
         eta_min_factor=0.05,
-        warmup_epochs=4,
-        use_focal_loss=False,
-        focal_gamma=1.8,
+        warmup_epochs=3,
+        use_focal_loss=True,
+        focal_gamma=1.6,
+        
+        early_stop_patience=4,
+        early_stop_min_delta=1e-4,
         pooling="attn",
+        monitor = 'val_auc'
     )
 
-    pos_weight = float((labels == 0).sum() / max(1, (labels == 1).sum()))
+    # pos_weight = float((labels == 0).sum() / max(1, (labels == 1).sum()))
+    pos_weight = 2.0
 
     train_sequences = build_user_sequences(train_df, artifacts.numeric_cols, config.max_seq_len)
     val_sequences = build_user_sequences(val_df, artifacts.numeric_cols, config.max_seq_len)
@@ -112,7 +129,7 @@ def main() -> None:
         collate_fn=collate_batch,
     )
 
-    seeds = [42, 43, 44,45,46]
+    seeds = [42, 43, 44]
     val_prob_dicts: list[dict[str, float]] = []
     test_prob_dicts: list[dict[str, float]] = []
 
@@ -127,7 +144,7 @@ def main() -> None:
             config=config,
         ).to(device)
 
-        _, _, model, best_epoch, _ = train_model(
+        train_losses, val_losses, model, best_epoch, _ = train_model(
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,
@@ -143,6 +160,7 @@ def main() -> None:
             focal_gamma=config.focal_gamma,
             early_stop_patience=config.early_stop_patience,
             early_stop_min_delta=config.early_stop_min_delta,
+            monitor = config.monitor
         )
 
         print(f"[seed={seed}] best_epoch={best_epoch}")
@@ -150,6 +168,15 @@ def main() -> None:
         test_probs = predict_proba(model, test_loader, device)
         val_prob_dicts.append(val_probs)
         test_prob_dicts.append(test_probs)
+        plt.figure(figsize=(6,4))
+        plt.plot(train_losses, label='train')
+        plt.plot(val_losses, label='val')
+        plt.xlabel('epoch')
+        plt.ylabel('loss')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig('training_loss.png', dpi=150)
+        plt.show()
 
     val_probs_avg = average_prob_dicts(val_prob_dicts)
     test_probs_avg = average_prob_dicts(test_prob_dicts)
@@ -187,9 +214,36 @@ def main() -> None:
     out_path = Path("submission_event_ensemble.csv")
     sub.to_csv(out_path, index=False)
     print(f"wrote: {out_path}")
+
+    if submit_to_kaggle:
+        run_note = (
+            f"event_ens{len(seeds)}_pool={config.pooling}_thr={best_thr:.3f}"
+            f"_auc={auc:.4f}_do={config.dropout}_lr={config.lr:g}_wd={config.weight_decay:g}"
+        )
+        submit_and_track(
+            out_path,
+            competition,
+            run_note,
+            extra_meta={
+                "model": "event_transformer_ensemble",
+                "seeds": ",".join(map(str, seeds)),
+                "pooling": config.pooling,
+                "best_threshold": float(best_thr),
+                "val_auc": float(auc),
+                "val_best_f1": float(best_f1),
+                "max_seq_len": int(config.max_seq_len),
+                "d_model": int(config.d_model),
+                "nhead": int(config.nhead),
+                "num_layers": int(config.num_layers),
+                "dim_feedforward": int(config.dim_feedforward),
+                "dropout": float(config.dropout),
+                "lr": float(config.lr),
+                "weight_decay": float(config.weight_decay),
+                "epochs": int(config.epochs),
+            },
+        )
     
 
 #%%
 if __name__ == "__main__":
     main()
-
