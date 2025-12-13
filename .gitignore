@@ -28,6 +28,7 @@ venv/
 *.joblib
 *.png
 
+
 # Logs
 *.log
 
@@ -37,3 +38,5 @@ venv/
 # Build outputs
 build/
 dist/
+
+codex_report.md
