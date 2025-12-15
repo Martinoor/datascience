@@ -55,7 +55,7 @@ def _safe_get(obj: Any, keys: Iterable[str]) -> Optional[Any]:
                 return v
     return None
 def _status_to_str(s: Any) -> str:
-    # 你的 _status 是 SubmissionStatus 枚举
+    # ``_status`` is typically a SubmissionStatus enum.
     if s is None:
         return ""
     return str(getattr(s, "name", s)).lower()

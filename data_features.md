@@ -1,84 +1,84 @@
-# Transformer 模型特征与指标说明
+# Transformer Model Features and Metrics Notes
 
-## 一、问题与数据 & 目标概况
+## 1. Problem, Data, and Target Overview
 
-- 任务（以 Kaggle 数据为准）：利用用户在观测期内的行为序列，预测该用户是否会流失（是否访问页面 `Cancellation Confirmation`）。
-- 样本定义：
-  - 数据来自 `train.parquet` / `test.parquet`，每一行是一条用户行为事件。
-  - 每个用户的行为序列长度不同（有的只有几条，有的达到一万多条）。
-- 数据时间范围（从 parquet 统计信息核对）：
-  - `train.parquet`：`2018-10-01` ~ `2018-11-20`
-  - `test.parquet`：`2018-10-01` ~ `2018-11-20`
-- 关于“10 天窗口 after 2018-11-20”的说明：
-  - 项目描述里提到了 “after 2018-11-20 的 10 天窗口”，但当前发下来的 `train/test.parquet` 事件时间本身就截止到 `2018-11-20`，因此**在现有数据上无法直接构造**“2018-11-20 之后 10 天”的标签。
-  - 实操上（也与 Kaggle 的数据形态一致：test 没有取消事件、train 有取消事件）：本项目把 churn 定义为“用户是否出现过 `Cancellation Confirmation`”，并据此训练/提交。
-- 标签（churn）构造（基于当前 pipeline）：
-  - 对 `train.parquet` 按 `userId` 聚合，只要该用户全历史序列中任意事件的 `page == "Cancellation Confirmation"`，则记为 `churn = 1`，否则为 `0`。
-  - 对于最终发生取消的用户，`Cancellation Confirmation` 通常出现在该用户序列的最后一条或最后几条事件，这条信息不能直接用于特征（否则泄露标签）。
-- 当前数据标签统计（train）：
-  - 用户数：19,140
-  - churn=1：4,271（约 22.3%）
-  - churn=0：14,869（约 77.7%）
-- 评估指标（Kaggle 官方）：Balanced Accuracy Score（平衡准确率）
+- Task (per the Kaggle data): use each user's behavior sequence within the observation window to predict whether the user will churn (i.e., whether they visit the page `Cancellation Confirmation`).
+- Sample definition:
+  - Data comes from `train.parquet` / `test.parquet`; each row is one user behavior event.
+  - Sequence length varies widely by user (from a few events to 10k+ events).
+- Event time range (verified from parquet statistics):
+  - `train.parquet`: `2018-10-01` ~ `2018-11-20`
+  - `test.parquet`: `2018-10-01` ~ `2018-11-20`
+- Note on the “10-day window after 2018-11-20”:
+  - The project description mentions “a 10-day window after 2018-11-20”, but the released `train/test.parquet` events themselves end at `2018-11-20`, so **we cannot directly construct** a label for “10 days after 2018-11-20” from the provided data.
+  - In practice (also matching the Kaggle data shape: `test` has no cancellation events, `train` has cancellation events), this project defines churn as “whether the user ever has `Cancellation Confirmation`”, and trains/submits accordingly.
+- Label (churn) construction (current pipeline):
+  - Aggregate `train.parquet` by `userId`. If any event in the user's full history has `page == "Cancellation Confirmation"`, set `churn = 1`; otherwise `0`.
+  - For users who eventually cancel, `Cancellation Confirmation` usually appears at the very end (last one or a few events). This information must not be used as a feature (label leakage).
+- Current label statistics (train):
+  - Users: 19,140
+  - churn=1: 4,271 (~22.3%)
+  - churn=0: 14,869 (~77.7%)
+- Evaluation metric (official Kaggle): Balanced Accuracy Score
   - `balanced_acc = (TPR + TNR) / 2`
-- 预测输出（提交文件）：`id,target`，其中 `target` 为 0/1（二分类标签）。
-  - 佐证：数据目录自带的 `churn-prediction-25-26/example_submission.csv` 也是 0/1 标签提交。
+- Prediction output (submission file): `id,target`, where `target` is 0/1 (binary label).
+  - Evidence: `churn-prediction-25-26/example_submission.csv` also uses 0/1 labels.
 
 ---
 
-!!!!项目的唯一描述：
+!!!!The only official project description:
  Here's the kaggle link for the competition : https://www.kaggle.com/competitions/churn-prediction-25-26
 The competition is to be performed in groups of two. You'll have a report of 4 pages to submit by december 14th, presenting the methods you tested and used. For the defense you'll get 8 minutes of presentations + 7 minutes of questions, including on question on the labs, that may involve writing a code snippet.
 kaggle.com
 Churn prediction 25/26
 Predict churn prediction from streaming service logs
 9:19
-The goal of the competition is to predict whether or not some users (whose user ids are in the test file) will churn in the window of 10 days that follows the given observations (ie after "2018-11-20"). We consider that a user churns when they visit the page 'Cancellation Confirmation' （已编辑） 
+The goal of the competition is to predict whether or not some users (whose user ids are in the test file) will churn in the window of 10 days that follows the given observations (ie after "2018-11-20"). We consider that a user churns when they visit the page 'Cancellation Confirmation' (edited)
 9:21
 This is not a trivial challenge ; to get a decent score, we strongly advise you to start working on it right away.
 
-## 二、现有特征是否充分？（基于 `feature_pipeline.py`）
+## 2. Are the Current Features Sufficient? (based on `feature_pipeline.py`)
 
-### 2.1 已覆盖的主要信息
-当前特征（给 Transformer 的 per-event 数值特征 + 类别 embedding）总体覆盖面已经比较全，核心包括：
+### 2.1 What is already covered
+The current features (per-event numeric features + categorical embeddings for the Transformer) already cover most major information dimensions, including:
 
-- 行为序列本身：`page_id` / `prev_page_id`（由 page embedding 学序列模式）
-- 时间与节奏：`seconds_since_prev_event`、`hour_sin/cos`、`dow_sin/cos`
-- Session 结构：session 内事件序号、session 时长、进度等
-- 订阅状态与变化：`level`、升级/降级累计次数、距上次 level change 的时间/事件数
-- 质量/异常：历史 404 比例（`error occur`）
-- 内容消费与偏好集中度：distinct song/artist、top1/top3 占比与次数
-- 跳过行为：skip flag、skip ratio（累计 + rolling window）
-- 用户背景：device / metro / state（类别 embedding）
+- The behavior sequence itself: `page_id` / `prev_page_id` (sequence patterns learned via page embeddings)
+- Time and cadence: `seconds_since_prev_event`, `hour_sin/cos`, `dow_sin/cos`
+- Session structure: event index within session, session duration, progress, etc.
+- Subscription state and changes: `level`, cumulative upgrade/downgrade counts, time/events since last level change
+- Quality/anomalies: historical 404 ratio (`error occur`)
+- Content consumption and concentration: distinct song/artist, top1/top3 fractions and counts
+- Skipping behavior: skip flags and skip ratios (cumulative + rolling window)
+- User context: device / metro / state (categorical embeddings)
 
-### 2.2 可能的缺口（建议增补方向）
-如果要继续挖收益，建议优先考虑“与 churn 更直接相关、且不会引入泄露”的信息：
+### 2.2 Potential gaps (recommended additions)
+If you want to keep pushing for gains, prioritize information that is more directly related to churn and does not introduce leakage:
 
-- 更强的“活跃度/衰退”信号：以天为粒度的活跃天数、最近 N 天 session 数、最近活跃距 cutoff 的天数（recency）
-- 更强的“行为突变”信号：最近 N 次/最近 N 天内关键页面占比的变化率（例如 Help/Settings/Error/Logout 的变化）
-- 页面集合扩展：当前只对 `KEY_PAGES` 做了 rolling/count 特征；可尝试把与 churn 更相关的 page 加入（例如 Thumbs Down、Roll Advert、Add to Playlist 等，需先统计其在数据中是否常见）
+- Stronger “activity/decay” signals: active days (daily granularity), number of sessions in the last N days, days since last activity before cutoff (recency)
+- Stronger “behavior shift” signals: change rates of key-page ratios over the last N events / last N days (e.g., Help/Settings/Error/Logout)
+- Expand the page set: currently rolling/count features are built only for `KEY_PAGES`; try adding pages that may be more churn-related (e.g., Thumbs Down, Roll Advert, Add to Playlist), after checking whether they are common in the data
 
-### 2.3 是否需要删减？（建议删减/加速方向）
-“删减”我建议按两类看：一类是纯冗余计算（一定该删），另一类是可能有用但需要 ablation 验证。
+### 2.3 Should we prune features? (pruning/speed suggestions)
+I recommend thinking about “pruning” in two buckets: pure redundant computation (should remove), vs. potentially useful but needs ablation.
 
-- 明确的冗余计算（已处理）：旧版本 `feature_engineer()` 曾生成全量 page one-hot，但 `prepare_datasets()` 随后会把这些 one-hot 列全部 drop 掉（`drop_cols = set(page_categories)`）；这块属于纯浪费，已在代码里移除。
-- 需要 ablation 的计算：`get_song_stats_fast()` 和部分 rolling 特征计算成本高；若你发现训练耗时或缓存占用过大，可以把它们作为“可开关的特征组”，用线上分数/本地 balanced accuracy 做去除对比再决定保留与否。
+- Clear redundant computation (already handled): older `feature_engineer()` versions generated full page one-hot columns, but `prepare_datasets()` later dropped all those columns (`drop_cols = set(page_categories)`); this was pure waste and has already been removed.
+- Candidate for ablation: `get_song_stats_fast()` and some rolling features can be expensive. If training time or cache size becomes an issue, consider making them “toggleable feature groups” and decide based on online score / local balanced accuracy comparisons.
 
-## 三、目标/验证集与 Kaggle 分数差异：我认为问题主要不在“目标偏差”，而在“指标未对齐”
+## 3. Local validation vs. Kaggle score: the issue is mainly metric misalignment
 
-你现在的本地打印主要是 `val_auc` + “按 F1 选阈值”，但 Kaggle 的评估指标是 **Balanced Accuracy**，因此出现“本地看起来不错、线上分数不一致”是非常典型的。
+Your local reporting focuses on `val_auc` plus “pick threshold by F1”, while Kaggle evaluates **Balanced Accuracy**. It is very common to see “local looks good, online score differs” under this mismatch.
 
-### 3.1 目标（label）是否符合 Kaggle？
-- 从数据本身核对：`train/test` 的事件时间都截止到 `2018-11-20`；`test` 中 `Cancellation Confirmation` 为 0 行，而 `train` 中有 4,271 行（且对应 4,271 个用户）。
-- 这意味着：Kaggle 的 churn 标签基本就是“该用户是否出现过 `Cancellation Confirmation`”，与你当前 `feature_pipeline.prepare_datasets()` 的 label 构造是一致的（目标本身大概率没有偏）。
+### 3.1 Does the label match Kaggle?
+- Verified from the data: both `train/test` event times end at `2018-11-20`; `test` has 0 rows of `Cancellation Confirmation`, while `train` has 4,271 rows (corresponding to 4,271 users).
+- This strongly suggests the churn label is essentially “whether the user ever has `Cancellation Confirmation`”, which matches your current `feature_pipeline.prepare_datasets()` label construction.
 
-### 3.2 为什么你的 validation 和 Kaggle 分数差很多？
-主要是两点“对齐问题”叠加：
+### 3.2 Why is validation so different from Kaggle?
+Two alignment issues stack up:
 
-- 评估指标不一致：你本地看的是 AUC（阈值无关），但线上算的是 Balanced Accuracy（阈值相关）。
-- 阈值选择目标不一致：你用 F1 选阈值，但线上看的是 Balanced Accuracy；同一组概率输出下，这两个指标最优阈值通常不同。
+- Metric mismatch: locally you look at AUC (threshold-free), but Kaggle uses Balanced Accuracy (threshold-dependent).
+- Threshold objective mismatch: you choose threshold by F1, but Kaggle rewards Balanced Accuracy; for the same probability outputs, their optimal thresholds are often different.
 
-### 3.3 建议你用什么方式做本地验证（先不改代码的结论版）
-- 本地验证请至少同时记录两组数：`val_balanced_accuracy`（用与你提交一致的 0/1 输出） + `val_auc`（辅助观察排序质量）。
-- 阈值选择请以 `balanced_accuracy` 为目标（扫描阈值即可），不要用 F1 来决定最终提交阈值。
-- 若你想进一步让验证更贴近线上分布：把 split 从“随机按用户划分”逐步换成“更时间一致/更接近 test 的设定”（例如用更靠近 `2018-11-20` 的 cutoff 或者按时间做 holdout），再比较线上分数是否更稳定。
+### 3.3 Recommended local validation (without changing code yet)
+- Log at least two numbers: `val_balanced_accuracy` (with the same 0/1 outputs as submission) + `val_auc` (to monitor ranking quality).
+- Choose threshold by maximizing `balanced_accuracy` (scan thresholds), not by F1.
+- If you want validation to better match the online distribution, move from random user split toward a more time-consistent holdout (e.g., a cutoff closer to `2018-11-20` or time-based holdout), then check whether online scores become more stable.

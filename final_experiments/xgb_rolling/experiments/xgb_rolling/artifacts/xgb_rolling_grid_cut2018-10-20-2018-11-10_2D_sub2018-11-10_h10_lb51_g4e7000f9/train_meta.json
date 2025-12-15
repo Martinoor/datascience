@@ -1,0 +1,6 @@
+{
+  "val_auc": 0.7058088970495695,
+  "best_thr": 0.01,
+  "best_bal": 0.5,
+  "best_n_estimators": 5000
+}

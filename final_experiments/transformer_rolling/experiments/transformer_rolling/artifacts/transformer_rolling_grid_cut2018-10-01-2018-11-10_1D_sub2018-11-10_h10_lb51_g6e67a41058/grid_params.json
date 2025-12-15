@@ -1,0 +1,9 @@
+{
+  "d_model": 192,
+  "nhead": 4,
+  "num_layers": 2,
+  "dim_feedforward": 256,
+  "dropout": 0.5,
+  "weight_decay": 0.007,
+  "pos_weight": 7.0
+}
