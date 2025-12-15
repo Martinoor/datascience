@@ -1,0 +1,73 @@
+{
+  "xgb_rolling": {
+    "metric": "val_bal_acc",
+    "updated_at_utc": "2025-12-14T09:32:21",
+    "run_name": "xgb_rolling_grid_cut2018-10-20-2018-11-10_2D_sub2018-11-10_h10_lb51_g73e5f9a6",
+    "grid_id": "73e5f9a6",
+    "val_bal_acc": 0.6461455681681616,
+    "val_auc": 0.7035689703878624,
+    "thr": 0.21000000000000002,
+    "top_runs": [
+      {
+        "rank": 1,
+        "grid_id": "73e5f9a6",
+        "run_name": "xgb_rolling_grid_cut2018-10-20-2018-11-10_2D_sub2018-11-10_h10_lb51_g73e5f9a6",
+        "val_bal_acc": 0.6461455681681616,
+        "val_auc": 0.7035689703878624,
+        "thr": 0.21000000000000002,
+        "best_n_estimators": 5000,
+        "params": {
+          "learning_rate": 0.03,
+          "max_depth": 6,
+          "min_child_weight": 2.0,
+          "subsample": 0.7,
+          "colsample_bytree": 0.7,
+          "reg_lambda": 0.5,
+          "reg_alpha": 0.5,
+          "gamma": 0.0,
+          "scale_pos_weight": 5
+        }
+      },
+      {
+        "rank": 2,
+        "grid_id": "bc59ed35",
+        "run_name": "xgb_rolling_grid_cut2018-10-20-2018-11-10_2D_sub2018-11-10_h10_lb51_gbc59ed35",
+        "val_bal_acc": 0.6461455681681616,
+        "val_auc": 0.7035689703878624,
+        "thr": 0.21000000000000002,
+        "best_n_estimators": 5000,
+        "params": {
+          "learning_rate": 0.03,
+          "max_depth": 6,
+          "min_child_weight": 2.0,
+          "subsample": 0.7,
+          "colsample_bytree": 0.7,
+          "reg_lambda": 0.5,
+          "reg_alpha": 0.5,
+          "gamma": 0.5,
+          "scale_pos_weight": 5
+        }
+      },
+      {
+        "rank": 3,
+        "grid_id": "6509cf5f",
+        "run_name": "xgb_rolling_grid_cut2018-10-20-2018-11-10_2D_sub2018-11-10_h10_lb51_g6509cf5f",
+        "val_bal_acc": 0.6461455681681616,
+        "val_auc": 0.7034295669042367,
+        "thr": 0.21000000000000002,
+        "best_n_estimators": 5000,
+        "params": {
+          "learning_rate": 0.03,
+          "max_depth": 6,
+          "min_child_weight": 2.0,
+          "subsample": 0.7,
+          "colsample_bytree": 0.7,
+          "reg_lambda": 0.5,
+          "reg_alpha": 0.0,
+          "gamma": 0.0,
+          "scale_pos_weight": 5
+        }
+      }
+    ]
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "auth_values": [
+    "Guest",
+    "Logged In",
+    "Logged Out"
+  ],
+  "methods": [
+    "GET",
+    "PUT"
+  ],
+  "pages": [
+    "About",
+    "Add Friend",
+    "Add to Playlist",
+    "Downgrade",
+    "Error",
+    "Help",
+    "Home",
+    "Login",
+    "Logout",
+    "NextSong",
+    "Register",
+    "Roll Advert",
+    "Save Settings",
+    "Settings",
+    "Submit Downgrade",
+    "Submit Registration",
+    "Submit Upgrade",
+    "Thumbs Down",
+    "Thumbs Up",
+    "Upgrade"
+  ],
+  "statuses": [
+    200,
+    307,
+    404
+  ]
+}

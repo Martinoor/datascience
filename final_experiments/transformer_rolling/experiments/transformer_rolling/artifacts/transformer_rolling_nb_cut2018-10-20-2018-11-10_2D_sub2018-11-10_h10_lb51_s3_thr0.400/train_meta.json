@@ -1,0 +1,32 @@
+{
+  "run_name": "transformer_rolling_nb_cut2018-10-20-2018-11-10_2D_sub2018-11-10_h10_lb51_s3_thr0.400",
+  "cutoffs": [
+    "2018-10-20",
+    "2018-10-22",
+    "2018-10-24",
+    "2018-10-26",
+    "2018-10-28",
+    "2018-10-30",
+    "2018-11-01",
+    "2018-11-03",
+    "2018-11-05",
+    "2018-11-07",
+    "2018-11-09"
+  ],
+  "submission_cutoff": "2018-11-10",
+  "lookback_days": 51,
+  "horizon_days": 10,
+  "label_mode": "horizon",
+  "seeds": [
+    42,
+    2021,
+    7
+  ],
+  "val_auc": 0.7570982480280969,
+  "best_thr_bal": 0.4,
+  "best_bal_acc": 0.6952621047982183,
+  "num_features": 98,
+  "train_rows_user_day": 4872087,
+  "val_rows_user_day": 1233573,
+  "pos_weight": 7.0
+}

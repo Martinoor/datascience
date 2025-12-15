@@ -7,14 +7,38 @@ both train and test consistently.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import pickle
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from numbers import Integral
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
+
+FEATURE_PIPELINE_VERSION = "1.3"
+
+# Key pages to track sequence statistics for (counts / rolling ratios).
+KEY_PAGES: List[str] = [
+    "Help",
+    "Settings",
+    "Upgrade",
+    "Downgrade",
+    "Submit Upgrade",
+    "Submit Downgrade",
+    "Logout",
+    "Error",
+    "Add Friend",
+]
+KEY_PAGE_ROLLING_WINDOW = 50
+SKIP_FRACTION_THRESHOLD = 0.5  # Fraction of song played below which we treat it as a skip
+
 
 @dataclass
 class FeatureArtifacts:
@@ -59,7 +83,8 @@ def truncate_user_histories(
     reduce leakage from behaviors right before churn events.
     """
     kept = []
-    for _, g in df.sort_values(["userId", "time"]).groupby("userId", sort=False):
+    grouped = df.sort_values(["userId", "time"]).groupby("userId", sort=False)
+    for _, g in tqdm(grouped, total=grouped.ngroups, desc="truncate_user_histories"):
         L = len(g)
         buffer = max(buffer_min, int(L * buffer_frac))
         if L <= 1:
@@ -68,6 +93,19 @@ def truncate_user_histories(
         cutoff = max(L - buffer, 1)
         kept.append(g.iloc[:cutoff])
     return pd.concat(kept, ignore_index=True)
+
+
+def truncate_last_days_per_user(df: pd.DataFrame, days: int) -> pd.DataFrame:
+    """
+    Remove the most recent `days` worth of events for each user to simulate
+    forecasting into a future window.
+    """
+    if days <= 0:
+        return df.copy()
+    delta = pd.Timedelta(days=days)
+    user_max = df.groupby("userId")["time"].transform("max")
+    cutoff = user_max - delta
+    return df[df["time"] <= cutoff].copy()
 
 
 def _build_mapping(series_list: Sequence[pd.Series]) -> Dict[str, int]:
@@ -216,11 +254,237 @@ def get_song_stats_fast(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _add_page_dummies(df: pd.DataFrame, page_categories: Sequence[str]) -> pd.DataFrame:
-    cat_type = pd.api.types.CategoricalDtype(categories=page_categories)
-    df["page"] = df["page"].astype(cat_type)
-    dummies = pd.get_dummies(df["page"])
-    df = pd.concat([df, dummies], axis=1)
+def _safe_page_feature_name(page: str) -> str:
+    """Turn a raw page name into a safe, concise column name fragment."""
+    name = page.strip().lower()
+    for ch in [" ", "/", "-", "(", ")", "[", "]"]:
+        name = name.replace(ch, "_")
+    while "__" in name:
+        name = name.replace("__", "_")
+    return name.strip("_")
+
+
+def _add_page_sequence_features(df: pd.DataFrame, window: int = KEY_PAGE_ROLLING_WINDOW) -> pd.DataFrame:
+    """
+    For each key page, add:
+    - cumulative count up to current event per user
+    - rolling ratio over the last `window` events per user
+
+    Implemented with groupby + cumsum / rolling to stay vectorized and efficient.
+    """
+    if "userId" not in df or "page" not in df:
+        return df
+
+    user_ids = df["userId"]
+    for page in KEY_PAGES:
+        safe = _safe_page_feature_name(page)
+        flag = (df["page"] == page).astype(np.int8)
+
+        count_col = f"{safe}_count_until_now"
+        ratio_col = f"{safe}_ratio_last_{window}_events"
+
+        # Cumulative count of this page for each user.
+        df[count_col] = flag.groupby(user_ids).cumsum().astype(np.int32)
+
+        # Rolling ratio of this page in the last `window` events for each user.
+        rolling = (
+            flag.groupby(user_ids)
+            .rolling(window, min_periods=1)
+            .mean()
+            .reset_index(level=0, drop=True)
+        )
+        df[ratio_col] = rolling.astype(np.float32)
+
+    return df
+
+
+def _add_level_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add features describing level changes and upgrade/downgrade behavior.
+
+    - level_change_flag: whether the user's level changed vs the previous event.
+    - num_upgrade_events_until_now / num_downgrade_events_until_now: cumulative counts
+      of upgrade / downgrade related page events.
+    - events_since_last_level_change: number of events since the last level change
+      within each user's history (0 if never changed yet).
+    - days_since_last_level_change: time since the last level change in days
+      (0 if never changed yet).
+    """
+    if "userId" not in df or "level" not in df or "page" not in df or "time" not in df:
+        return df
+
+    # Flag level changes relative to previous event per user.
+    prev_level = df.groupby("userId")["level"].shift(1)
+    prev_level = prev_level.fillna(df["level"])
+    df["level_change_flag"] = (df["level"] != prev_level).astype(np.int8)
+
+    # Upgrade / downgrade events derived from pages.
+    upgrade_pages = {"Upgrade", "Submit Upgrade"}
+    downgrade_pages = {"Downgrade", "Submit Downgrade"}
+    user_ids = df["userId"]
+
+    upgrade_flag = df["page"].isin(upgrade_pages).astype(np.int8)
+    downgrade_flag = df["page"].isin(downgrade_pages).astype(np.int8)
+
+    df["num_upgrade_events_until_now"] = (
+        upgrade_flag.groupby(user_ids).cumsum().astype(np.int32)
+    )
+    df["num_downgrade_events_until_now"] = (
+        downgrade_flag.groupby(user_ids).cumsum().astype(np.int32)
+    )
+
+    # Events since last level change (per user).
+    event_idx = df.groupby(user_ids).cumcount().astype(np.int32)
+    last_change_idx = event_idx.where(df["level_change_flag"] == 1)
+    last_change_idx = last_change_idx.groupby(user_ids).ffill()
+    events_since = (event_idx - last_change_idx).fillna(event_idx).astype(np.int32)
+    df["events_since_last_level_change"] = events_since
+
+    # Time since last level change in days (0 if never changed).
+    last_change_time = df["time"].where(df["level_change_flag"] == 1)
+    last_change_time = last_change_time.groupby(user_ids).ffill()
+    delta_days = (df["time"] - last_change_time).dt.total_seconds() / (3600.0 * 24.0)
+    df["days_since_last_level_change"] = delta_days.fillna(0.0).astype(np.float32)
+
+    return df
+
+
+def _add_skip_and_length_features(
+    df: pd.DataFrame, window: int = KEY_PAGE_ROLLING_WINDOW
+) -> pd.DataFrame:
+    """
+    Add skip-related features based on NextSong behavior and song length:
+
+    - skip_event_flag: whether the previous song is considered skipped (based on
+      fraction of its length played before the next NextSong).
+    - num_skip_events_until_now / skip_ratio_until_now: cumulative skip stats.
+    - skip_ratio_last_{window}_events: rolling skip ratio over a recent window
+      of events (captures skip bursts).
+    - num_nextsong_until_now / avg_song_length_until_now: cumulative song count
+      and average song length for NextSong events.
+
+    All computations are vectorized via groupby/rolling for efficiency.
+    """
+    if (
+        "userId" not in df
+        or "page" not in df
+        or "time" not in df
+        or "length" not in df
+    ):
+        return df
+
+    user_ids = df["userId"]
+    is_nextsong = (df["page"] == "NextSong").astype(np.int8)
+    df["is_nextsong"] = is_nextsong
+
+    # Default: no skip.
+    df["skip_event_flag"] = np.zeros(len(df), dtype=np.float32)
+
+    # Compute skip flag and (optionally) play fraction only on NextSong rows.
+    mask = is_nextsong == 1
+    if mask.any():
+        ns = df[mask].copy()
+        ns = ns.sort_values(["userId", "time"])
+        g = ns.groupby("userId", sort=False)
+
+        # Time difference between this NextSong and the next NextSong for the same user.
+        next_time = g["time"].shift(-1)
+        play_secs = (next_time - ns["time"]).dt.total_seconds()
+
+        # Length of the current song; use NaN to avoid division by zero.
+        song_len = ns["length"].replace(0, np.nan)
+        play_frac = (play_secs / song_len).astype(np.float32)
+        play_frac = play_frac.clip(lower=0.0, upper=5.0)
+
+        skip_flag = (play_frac < SKIP_FRACTION_THRESHOLD).astype(np.float32)
+        skip_flag = skip_flag.fillna(0.0)
+
+        # Assign back to the main dataframe for NextSong rows.
+        df.loc[ns.index, "skip_event_flag"] = skip_flag
+
+    # Cumulative skip counts and ratios.
+    skip_flag_all = df["skip_event_flag"].astype(np.float32)
+    df["num_skip_events_until_now"] = (
+        skip_flag_all.groupby(user_ids).cumsum().astype(np.int32)
+    )
+
+    num_songs = is_nextsong.groupby(user_ids).cumsum().astype(np.int32)
+    df["num_nextsong_until_now"] = num_songs
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = df["num_skip_events_until_now"] / num_songs.replace(0, np.nan)
+    df["skip_ratio_until_now"] = ratio.fillna(0.0).astype(np.float32)
+
+    # Rolling skip ratio over the last `window` events (captures skip bursts).
+    rolling = (
+        skip_flag_all.groupby(user_ids)
+        .rolling(window, min_periods=1)
+        .mean()
+        .reset_index(level=0, drop=True)
+    )
+    df[f"skip_ratio_last_{window}_events"] = rolling.astype(np.float32)
+
+    # Average song length based on NextSong events.
+    song_len_for_avg = df["length"].where(is_nextsong == 1, 0.0).astype(np.float32)
+    cum_len = song_len_for_avg.groupby(user_ids).cumsum()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        avg_len = cum_len / num_songs.replace(0, np.nan)
+    df["avg_song_length_until_now"] = avg_len.fillna(0.0).astype(np.float32)
+
+    return df
+
+
+def _add_rhythm_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add lightweight time/rhythm features (vectorized).
+
+    These are designed to be cheap even on the full event table.
+    """
+    if "userId" not in df or "time" not in df:
+        return df
+
+    prev_time = df.groupby("userId")["time"].shift(1)
+    delta = (df["time"] - prev_time).dt.total_seconds()
+    delta = delta.fillna(0).clip(lower=0).astype(np.float32)
+
+    df["seconds_since_prev_event"] = delta
+    df["log1p_seconds_since_prev_event"] = np.log1p(delta).astype(np.float32)
+
+    hour = df["time"].dt.hour.astype(np.float32)
+    df["hour_sin"] = np.sin(2 * np.pi * hour / 24.0).astype(np.float32)
+    df["hour_cos"] = np.cos(2 * np.pi * hour / 24.0).astype(np.float32)
+
+    dow = df["time"].dt.dayofweek.astype(np.float32)
+    df["dow_sin"] = np.sin(2 * np.pi * dow / 7.0).astype(np.float32)
+    df["dow_cos"] = np.cos(2 * np.pi * dow / 7.0).astype(np.float32)
+    return df
+
+
+def _add_session_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add session-level structural features derived from (userId, sessionId).
+
+    We keep these as per-event features so they can be used in event sequences.
+    """
+    if "userId" not in df or "sessionId" not in df or "time" not in df:
+        return df
+
+    g = df.groupby(["userId", "sessionId"], sort=False)
+    start_time = g["time"].transform("min")
+    end_time = g["time"].transform("max")
+
+    elapsed = (df["time"] - start_time).dt.total_seconds().fillna(0).astype(np.float32)
+    duration = (end_time - start_time).dt.total_seconds().fillna(0).astype(np.float32)
+
+    df["session_elapsed_seconds"] = elapsed
+    df["session_duration_seconds"] = duration
+    df["session_event_count"] = g["time"].transform("size").astype(np.int32)
+    df["session_event_index"] = g.cumcount().astype(np.int32)
+    df["is_session_start"] = (df["session_event_index"] == 0).astype(np.int8)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        prog = elapsed / np.where(duration == 0, np.nan, duration)
+    df["session_progress"] = np.nan_to_num(prog, nan=0.0).astype(np.float32)
     return df
 
 
@@ -229,8 +493,8 @@ def feature_engineer(df: pd.DataFrame, page_categories: Sequence[str]) -> pd.Dat
     Apply the feature engineering steps to a raw dataframe.
     """
     df = df.copy()
-    to_drop = ["firstName", "lastName", "ts", "auth", "itemInSession", "sessionId", "method"]
-    df = df.drop(columns=to_drop)
+    to_drop = ["firstName", "lastName", "ts", "auth", "method"]
+    df = df.drop(columns=[c for c in to_drop if c in df.columns])
     df = df.sort_values(["userId", "time"])
 
     df["error occur"] = compute_error_ratio(df)  # Cumulative ratio of 404 responses up to each event
@@ -239,7 +503,23 @@ def feature_engineer(df: pd.DataFrame, page_categories: Sequence[str]) -> pd.Dat
     df["gender"] = df["gender"].map({"F": 0, "M": 1}).fillna(0).astype(np.int64)  # Binary gender flag
     df["level"] = df["level"].map({"free": 0, "paid": 1}).fillna(0).astype(np.int64)  # Paid vs free level
 
-    df = _add_page_dummies(df, page_categories)  # One-hot indicators for every page category
+    # Add sequence-based features for a handful of key pages (Help, Settings, etc.).
+    # This operates only on non-cancellation pages (train_raw has had cancellation rows removed),
+    # so we avoid direct label leakage.
+    df = _add_page_sequence_features(df)
+
+    # Level change / upgrade / downgrade related features.
+    df = _add_level_features(df)
+
+    # Skip behavior & song length related features.
+    df = _add_skip_and_length_features(df)
+
+    # Session and rhythm features.
+    df = _add_session_features(df)
+    df = _add_rhythm_features(df)
+
+    # Drop raw session keys after deriving features.
+    df = df.drop(columns=[c for c in ["itemInSession", "sessionId"] if c in df.columns])
 
     df[["metro", "state"]] = df["location"].str.rsplit(", ", n=1, expand=True)  # Split city/state from location
     df = df.drop(columns=["location"])
@@ -281,6 +561,7 @@ def _infer_numeric_cols(df: pd.DataFrame) -> List[str]:
         "time",
         "Cancellation Confirmation",
         "page_id",
+        "prev_page_id",
         "metro_id",
         "state_id",
         "device_id",
@@ -291,6 +572,35 @@ def _infer_numeric_cols(df: pd.DataFrame) -> List[str]:
     return numeric_cols
 
 
+def _build_cache_key(
+    train_path: str,
+    test_path: str,
+    val_ratio: float,
+    random_state: int,
+    truncate_buffer_min: int,
+    truncate_buffer_frac: float,
+    cutoff_time: Optional[Union[pd.Timestamp, str, int]],
+    drop_inactive_before_cutoff: bool,
+) -> str:
+    """
+    Build a stable hash key for a given feature configuration so that we can
+    cache and reuse computed datasets across runs.
+    """
+    key_payload = {
+        "version": FEATURE_PIPELINE_VERSION,
+        "train_path": str(Path(train_path).resolve()),
+        "test_path": str(Path(test_path).resolve()),
+        "val_ratio": float(val_ratio),
+        "random_state": int(random_state),
+        "truncate_buffer_min": int(truncate_buffer_min),
+        "truncate_buffer_frac": float(truncate_buffer_frac),
+        "cutoff_time": None if cutoff_time is None else str(cutoff_time),
+        "drop_inactive_before_cutoff": bool(drop_inactive_before_cutoff),
+    }
+    key_str = json.dumps(key_payload, sort_keys=True)
+    return hashlib.md5(key_str.encode("utf-8")).hexdigest()
+
+
 def prepare_datasets(
     train_path: str,
     test_path: str,
@@ -298,13 +608,44 @@ def prepare_datasets(
     random_state: int = 42,
     truncate_buffer_min: int = 2,
     truncate_buffer_frac: float = 0.1,
-    cutoff_time: Optional[pd.Timestamp] = None,
+    cutoff_time: Optional[Union[pd.Timestamp, str, int]] = None,
     drop_inactive_before_cutoff: bool = False,
+    use_cache: bool = True,
+    cache_dir: str = "feature_cache",
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, FeatureArtifacts]:
     """
     Full pipeline: load data, feature engineer, encode categoricals, scale numerics,
     and split users into train/validation.
+    - cutoff_time: str/timestamp keeps events before that absolute time; int drops each user's
+      most recent `cutoff_time` days to train on earlier history and predict the held-out window.
+    - use_cache: when True, cache the resulting datasets to disk keyed by the arguments so
+      subsequent runs with the same configuration can be loaded instantly.
     """
+    cache_path: Optional[Path] = None
+    if use_cache:
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_key = _build_cache_key(
+            train_path=train_path,
+            test_path=test_path,
+            val_ratio=val_ratio,
+            random_state=random_state,
+            truncate_buffer_min=truncate_buffer_min,
+            truncate_buffer_frac=truncate_buffer_frac,
+            cutoff_time=cutoff_time,
+            drop_inactive_before_cutoff=drop_inactive_before_cutoff,
+        )
+        cache_path = Path(cache_dir) / f"features_{cache_key}.pkl"
+        if cache_path.exists():
+            with cache_path.open("rb") as f:
+                cached = pickle.load(f)
+            return (
+                cached["train_df"],
+                cached["val_df"],
+                cached["test_df"],
+                cached["labels"],
+                cached["artifacts"],
+            )
+
     train_raw = pd.read_parquet(train_path)
     test_raw = pd.read_parquet(test_path)
 
@@ -315,17 +656,26 @@ def prepare_datasets(
         .astype(int)
     )
 
-    # Optional: only keep behaviors before a cutoff timestamp when building features
+    # Optional: only keep behaviors before a cutoff point when building features.
     if cutoff_time is not None:
-        cutoff_ts = pd.to_datetime(cutoff_time)
-        train_raw = train_raw[train_raw["time"] <= cutoff_ts].copy()
-        if drop_inactive_before_cutoff:
-            # Drop users who have no activity before the cutoff
-            active_users = train_raw["userId"].unique()
-            labels = labels[labels.index.isin(active_users)]
+        if isinstance(cutoff_time, Integral):
+            train_raw = truncate_last_days_per_user(train_raw, int(cutoff_time))
+            # test_raw = truncate_last_days_per_user(test_raw, int(cutoff_time))
+            if drop_inactive_before_cutoff:
+                active_users = train_raw["userId"].unique()
+                labels = labels[labels.index.isin(active_users)]
+        else:
+            cutoff_ts = pd.to_datetime(cutoff_time)
+            train_raw = train_raw[train_raw["time"] <= cutoff_ts].copy()
+            if drop_inactive_before_cutoff:
+                # Drop users who have no activity before the cutoff
+                active_users = train_raw["userId"].unique()
+                labels = labels[labels.index.isin(active_users)]
 
     # Remove Cancellation Confirmation rows from feature building to avoid leakage
     train_raw = train_raw[train_raw["page"] != "Cancellation Confirmation"].copy()
+    train_raw = train_raw[train_raw["page"] != "Cancel"].copy()
+    # test_raw = test_raw[test_raw["page"] != "Cancellation Confirmation"].copy()
 
     # Trim timelines to avoid using behaviors immediately before churn points
     train_raw = truncate_user_histories(
@@ -344,6 +694,14 @@ def prepare_datasets(
 
     train_fe = encode_categoricals(train_fe, page_categories, metro_map, state_map, device_map)
     test_fe = encode_categoricals(test_fe, page_categories, metro_map, state_map, device_map)
+
+    # Previous page ID within each user's sequence (0 = no previous page).
+    train_fe["prev_page_id"] = (
+        train_fe.groupby("userId")["page_id"].shift(1).fillna(0).astype(np.int64)
+    )
+    test_fe["prev_page_id"] = (
+        test_fe.groupby("userId")["page_id"].shift(1).fillna(0).astype(np.int64)
+    )
 
     train_fe["regis_time_seconds"] = train_fe["regis_time"].dt.total_seconds()  # Seconds since registration
     test_fe["regis_time_seconds"] = test_fe["regis_time"].dt.total_seconds()
@@ -396,4 +754,15 @@ def prepare_datasets(
         numeric_cols=numeric_cols,
         scaler=scaler,
     )
+    if cache_path is not None:
+        to_cache = {
+            "train_df": train_df,
+            "val_df": val_df,
+            "test_df": test_fe,
+            "labels": labels,
+            "artifacts": artifacts,
+        }
+        with cache_path.open("wb") as f:
+            pickle.dump(to_cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+
     return train_df, val_df, test_fe, labels, artifacts
