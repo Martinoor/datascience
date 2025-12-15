@@ -1,0 +1,16 @@
+{
+  "best_epoch": 7,
+  "best_threshold": 0.3799999952316284,
+  "loss_curve_csv": "runs/event_ensemble/20251212_234321_ens3_pool=attn_dm=256_l=4_ff=768_do=0.1_lr=0.0006_wd=0.0015_seq=450/seed=42/loss_curve.csv",
+  "loss_curve_png": "runs/event_ensemble/20251212_234321_ens3_pool=attn_dm=256_l=4_ff=768_do=0.1_lr=0.0006_wd=0.0015_seq=450/seed=42/loss_curve.png",
+  "model_state_path": "runs/event_ensemble/20251212_234321_ens3_pool=attn_dm=256_l=4_ff=768_do=0.1_lr=0.0006_wd=0.0015_seq=450/seed=42/model_state.pt",
+  "seconds": 456.329252243042,
+  "seed": 42,
+  "test_probs_path": "runs/event_ensemble/20251212_234321_ens3_pool=attn_dm=256_l=4_ff=768_do=0.1_lr=0.0006_wd=0.0015_seq=450/seed=42/test_probs.parquet",
+  "train_loss_last": 0.18417362748179553,
+  "val_auc": 0.7762850805517667,
+  "val_balanced_accuracy": 0.6995727121239417,
+  "val_loss_last": 0.23851389000691825,
+  "val_loss_min": 0.22713507064561292,
+  "val_probs_path": "runs/event_ensemble/20251212_234321_ens3_pool=attn_dm=256_l=4_ff=768_do=0.1_lr=0.0006_wd=0.0015_seq=450/seed=42/val_probs.parquet"
+}

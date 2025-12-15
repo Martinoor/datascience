@@ -1,0 +1,7 @@
+{
+  "best_threshold": 0.3799999952316284,
+  "run_finished_utc": "2025-12-13T22:37:37",
+  "run_note": "event_ens3_pool=attn_thr=0.380_bacc=0.7120_auc=0.7809_do=0.1_lr=1e-05_wd=0.0015",
+  "val_auc": 0.7809122230228787,
+  "val_balanced_accuracy": 0.7119888308412898
+}

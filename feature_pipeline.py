@@ -254,14 +254,6 @@ def get_song_stats_fast(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _add_page_dummies(df: pd.DataFrame, page_categories: Sequence[str]) -> pd.DataFrame:
-    cat_type = pd.api.types.CategoricalDtype(categories=page_categories)
-    df["page"] = df["page"].astype(cat_type)
-    dummies = pd.get_dummies(df["page"])
-    df = pd.concat([df, dummies], axis=1)
-    return df
-
-
 def _safe_page_feature_name(page: str) -> str:
     """Turn a raw page name into a safe, concise column name fragment."""
     name = page.strip().lower()
@@ -510,8 +502,6 @@ def feature_engineer(df: pd.DataFrame, page_categories: Sequence[str]) -> pd.Dat
 
     df["gender"] = df["gender"].map({"F": 0, "M": 1}).fillna(0).astype(np.int64)  # Binary gender flag
     df["level"] = df["level"].map({"free": 0, "paid": 1}).fillna(0).astype(np.int64)  # Paid vs free level
-
-    df = _add_page_dummies(df, page_categories)  # One-hot indicators for every page category
 
     # Add sequence-based features for a handful of key pages (Help, Settings, etc.).
     # This operates only on non-cancellation pages (train_raw has had cancellation rows removed),
