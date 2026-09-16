@@ -1,0 +1,12 @@
+[server]
+headless = true
+# The full Kaggle train.parquet is ~1 GB; mount it via DATA_DIR instead when possible.
+maxUploadSize = 2048
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+primaryColor = "#d6453d"

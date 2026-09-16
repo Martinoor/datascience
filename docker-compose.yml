@@ -1,0 +1,12 @@
+# docker compose up --build   ->  http://localhost:8501
+# Put the Kaggle files (train.parquet, test.parquet) in ./churn-prediction-25-26
+# to browse the real data; otherwise the app uses its synthetic sample.
+services:
+  app:
+    build: .
+    image: ghcr.io/martinoor/churn-explorer:local
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./churn-prediction-25-26:/data:ro
+    restart: unless-stopped

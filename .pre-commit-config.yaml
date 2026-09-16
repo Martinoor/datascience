@@ -1,0 +1,23 @@
+# uv tool install pre-commit && pre-commit install
+# Hooks only cover the app/package; the research code is kept byte-for-byte as committed.
+files: ^(src|app|tests|\.github|\.streamlit)/|^(pyproject\.toml|uv\.lock|Dockerfile|docker-compose\.yml|Makefile|\.pre-commit-config\.yaml)$
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.7
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: 0.12.15
+    hooks:
+      - id: uv-lock

@@ -40,3 +40,11 @@ build/
 dist/
 
 codex_report.md
+
+# Tooling caches / reports
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+junit.xml
+.claude/
