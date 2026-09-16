@@ -1,0 +1,10 @@
+# Allow-list: only what the image needs is sent to the build context.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!src/
+!app/
+!.streamlit/
+**/__pycache__
+**/*.py[cod]
